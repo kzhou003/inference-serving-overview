@@ -1,0 +1,5 @@
+src/trees/
+src/build.tmp
+src/print_book.html
+src/book_raw.pdf
+__pycache__/

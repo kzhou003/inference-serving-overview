@@ -1,0 +1,232 @@
+<script>
+/* Atlas: draws the hand-made "nautical chart" of the guide and routes #hash → chapter pane.
+   Coastlines are seeded noisy blobs; overlapping blobs read as one landmass because all halos,
+   then all coast strokes, then all fills are drawn in separate layers. */
+(function () {
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.getElementById("atlasMap");
+  if (!svg) return;
+  function el(tag, attrs, parent) {
+    const e = document.createElementNS(NS, tag);
+    for (const k in attrs) e.setAttribute(k, attrs[k]);
+    (parent || svg).appendChild(e);
+    return e;
+  }
+  function text(parent, x, y, s, cls, anchor) {
+    const t = el("text", { x, y, class: cls, "text-anchor": anchor || "start" }, parent);
+    t.textContent = s;
+    return t;
+  }
+  function rng(seed) { let s = seed * 9973 % 2147483647; return () => (s = s * 16807 % 2147483647) / 2147483647; }
+  function smooth(p, closed) {
+    const n = p.length, f = (v) => v.toFixed(1);
+    let d = `M${f(p[0][0])},${f(p[0][1])}`;
+    const last = closed ? n : n - 1;
+    for (let i = 0; i < last; i++) {
+      const p0 = p[closed ? (i - 1 + n) % n : Math.max(i - 1, 0)], p1 = p[i], p2 = p[(i + 1) % n], p3 = p[closed ? (i + 2) % n : Math.min(i + 2, n - 1)];
+      d += ` C${f(p1[0] + (p2[0] - p0[0]) / 6)},${f(p1[1] + (p2[1] - p0[1]) / 6)} ${f(p2[0] - (p3[0] - p1[0]) / 6)},${f(p2[1] - (p3[1] - p1[1]) / 6)} ${f(p2[0])},${f(p2[1])}`;
+    }
+    return closed ? d + "Z" : d;
+  }
+  function blob(cx, cy, rx, ry, seed, rough) {
+    const r = rng(seed), n = 26, ph1 = r() * 6.28, ph2 = r() * 6.28, R = rough === undefined ? 0.14 : rough;
+    const pts = [];
+    for (let i = 0; i < n; i++) {
+      const a = (i / n) * Math.PI * 2;
+      const k = 1 + R * (0.55 * Math.sin(3 * a + ph1) + 0.35 * Math.sin(5 * a + ph2) + 0.9 * (r() - 0.5));
+      pts.push([cx + Math.cos(a) * rx * k, cy + Math.sin(a) * ry * k]);
+    }
+    return smooth(pts, true);
+  }
+
+  // ---------- sea ----------
+  const defs = el("defs", {});
+  const wp = el("pattern", { id: "waves", width: 90, height: 46, patternUnits: "userSpaceOnUse" }, defs);
+  el("path", { d: "M8,14 q6,-6 12,0 t12,0 M52,36 q6,-6 12,0 t12,0", class: "wave" }, wp);
+  el("rect", { x: 0, y: 0, width: 1000, height: 700, class: "sea" });
+  el("rect", { x: 0, y: 0, width: 1000, height: 700, fill: "url(#waves)" });
+
+  // ---------- land ----------
+  const LAND = [
+    // LLM continent (four overlapping blobs)
+    [300, 300, 222, 162, 11], [480, 255, 165, 138, 23], [228, 432, 148, 92, 37], [522, 402, 122, 92, 41],
+    // MoE archipelago
+    [700, 395, 22, 16, 51, .25], [737, 368, 15, 11, 52, .25], [762, 410, 25, 17, 53, .25], [712, 442, 18, 13, 54, .25], [750, 458, 20, 14, 55, .25],
+    [788, 446, 13, 10, 56, .25], [690, 482, 15, 11, 57, .25], [732, 496, 19, 12, 58, .25], [777, 486, 12, 9, 59, .25],
+    // islands
+    [835, 148, 96, 70, 5], [886, 336, 80, 62, 8], [836, 572, 116, 72, 13], [590, 626, 92, 48, 17], [372, 630, 72, 42, 19], [150, 626, 104, 50, 29],
+    [44, 388, 30, 22, 31, .2], [395, 60, 72, 30, 71, .18], [575, 60, 78, 30, 72, .18], [702, 50, 20, 15, 73, .2], [966, 42, 18, 14, 74, .2]
+  ].map((b) => blob(b[0], b[1], b[2], b[3], b[4], b[5]));
+  const gHalo = el("g", {}), gCoast = el("g", {}), gLand = el("g", {});
+  LAND.forEach((d) => { el("path", { d, class: "halo" }, gHalo); el("path", { d, class: "coast" }, gCoast); el("path", { d, class: "land" }, gLand); });
+  // dashed inner contours on the single-blob islands for an engraved look
+  [[835, 148, 80, 58, 5], [886, 336, 66, 50, 8], [836, 572, 98, 60, 13], [590, 626, 76, 38, 17], [372, 630, 58, 32, 19], [150, 626, 88, 40, 29]]
+    .forEach((b) => el("path", { d: blob(b[0], b[1], b[2], b[3], b[4]), class: "contour" }));
+  // atoll lagoon, diffusion bay, omni lakes
+  el("path", { d: blob(840, 150, 48, 30, 61, .2), class: "water" });
+  el("path", { d: blob(760, 592, 42, 26, 62, .2), class: "water" });
+  [[858, 322, 14, 9, 63], [890, 340, 13, 8, 64], [918, 322, 12, 8, 65]].forEach((b) => el("path", { d: blob(b[0], b[1], b[2], b[3], b[4], .2), class: "water" }));
+  el("path", { d: "M872,324 Q878,334 877,338 M903,336 Q908,330 906,326", class: "river" });
+  // Token river: from the Roofline range through the capital to the east coast
+  el("path", { d: smooth([[330, 192], [356, 238], [392, 270], [438, 298], [500, 306], [560, 298], [612, 306], [646, 312]], false), class: "river" });
+
+  // ---------- glyphs ----------
+  const gG = el("g", {});
+  function mountain(x, y, s) {
+    el("path", { d: `M${x - s},${y} L${x},${y - 1.45 * s} L${x + s},${y} Z`, class: "glyph" }, gG);
+    el("path", { d: `M${x},${y - 1.45 * s} L${x + s},${y} L${x + 0.3 * s},${y} Z`, class: "glyph-shade" }, gG);
+    el("path", { d: `M${x - s},${y} L${x},${y - 1.45 * s} L${x + s},${y}`, class: "glyph-line" }, gG);
+  }
+  [[205, 196, 11], [232, 182, 14], [262, 194, 12], [292, 172, 16], [322, 188, 13], [350, 176, 15], [380, 192, 11], [262, 160, 9], [325, 152, 9]].forEach((m) => mountain(...m));
+  function marsh(x, y) { el("path", { d: `M${x - 7},${y} L${x + 7},${y} M${x - 3},${y} L${x - 4},${y - 7} M${x},${y} L${x},${y - 9} M${x + 3},${y} L${x + 4},${y - 7}`, class: "glyph-line" }, gG); }
+  [[150, 462], [182, 474], [214, 460], [246, 476], [278, 462], [198, 492], [262, 496], [128, 486]].forEach((m) => marsh(...m));
+  function tree(x, y) { el("path", { d: `M${x},${y} L${x},${y - 6}`, class: "glyph-line" }, gG); el("circle", { cx: x, cy: y - 10, r: 5, class: "glyph" }, gG); }
+  [[288, 330], [300, 342], [276, 346], [312, 324], [290, 358], [264, 332]].forEach((t) => tree(...t));
+  // capital walls
+  el("path", { d: "M380,290 L380,276 L386,276 L386,282 L392,282 L392,276 L398,276 L398,282 L404,282 L404,276 L410,276 L410,282 L416,282 L416,276 L422,276 L422,290 Z", class: "glyph" }, gG);
+  // plateau (cluster highlands)
+  el("path", { d: "M556,462 L570,446 L612,446 L626,462 Z", class: "glyph" }, gG);
+  el("path", { d: "M566,456 L616,456 M574,450 L606,450", class: "glyph-line" }, gG);
+  // gear on the robotics cape
+  el("circle", { cx: 628, cy: 624, r: 10, class: "glyph", "stroke-width": 5, "stroke-dasharray": "3.4 2.8" }, gG);
+  el("circle", { cx: 628, cy: 624, r: 6, class: "glyph" }, gG);
+  // fortress (sandbox)
+  el("path", { d: "M30,398 L30,380 L36,380 L36,386 L42,386 L42,380 L48,380 L48,386 L54,386 L54,380 L60,380 L60,398 Z M41,398 L41,391 L49,391 L49,398", class: "glyph" }, gG);
+  // terminal window on the coding-agent island
+  el("rect", { x: 384, y: 616, width: 40, height: 26, rx: 3, class: "glyph" }, gG);
+  el("path", { d: "M390,624 L396,629 L390,634 M400,635 L410,635", class: "glyph-line" }, gG);
+  // molecule + double helix on the science island
+  (function () { const cx = 190, cy = 628, r = 9; const pts = []; for (let i = 0; i < 6; i++) { const a = Math.PI / 6 + i * Math.PI / 3; pts.push([cx + r * Math.cos(a), cy + r * Math.sin(a)]); } el("path", { d: "M" + pts.map((p) => p.map((v) => v.toFixed(1)).join(",")).join(" L") + " Z", class: "glyph" }, gG); el("path", { d: `M${cx + r},${cy} L${cx + r + 9},${cy - 6}`, class: "glyph-line" }, gG); })();
+  (function () { const a = [], b = []; for (let t = 0; t <= 1; t += 0.05) { a.push([82 + 46 * t, 640 + 7 * Math.sin(t * 4 * Math.PI)]); b.push([82 + 46 * t, 640 - 7 * Math.sin(t * 4 * Math.PI)]); } el("path", { d: smooth(a, false), class: "glyph-line" }, gG); el("path", { d: smooth(b, false), class: "glyph-line" }, gG); })();
+  // spiral (denoising bay)
+  (function () { const p = []; for (let t = 0; t < 4.2 * Math.PI; t += 0.25) p.push([912 + Math.cos(t) * t * 1.6, 592 + Math.sin(t) * t * 1.1]); el("path", { d: smooth(p, false), class: "glyph-line" }, gG); })();
+  // lighthouse (interview) and books (references)
+  el("path", { d: "M724,60 L727,36 L733,36 L736,60 Z", class: "glyph" }, gG);
+  el("path", { d: "M725,44 L735,44 M726,52 L734,52 M720,32 L713,27 M740,32 L747,27 M730,30 L730,22", class: "glyph-line" }, gG);
+  // ships near the ecosystem port
+  function ship(x, y) { el("path", { d: `M${x - 12},${y} L${x + 12},${y} L${x + 8},${y + 6} L${x - 8},${y + 6} Z`, class: "glyph" }, gG); el("path", { d: `M${x},${y} L${x},${y - 16} L${x + 9},${y - 4} Z`, class: "glyph" }, gG); }
+  ship(52, 592); ship(272, 598); ship(660, 540);
+  // trade routes from the port (dotted)
+  el("path", { d: "M120,662 Q480,704 760,650", class: "glyph-line", "stroke-dasharray": "1 5", opacity: ".5" }, gG);
+
+  // ---------- sea labels ----------
+  [["Memory-Bound 洋", 731, 304, "font-size:14px;letter-spacing:.02em"], ["延 迟 之 海", 470, 560, ""]].forEach(([s, x, y, st]) => text(svg, x, y, s, "sea-label", "middle").setAttribute("style", st));
+
+  // ---------- title cartouche & compass ----------
+  const cg = el("g", {});
+  el("rect", { x: 18, y: 16, width: 262, height: 84, rx: 4, class: "cart" }, cg);
+  el("rect", { x: 24, y: 22, width: 250, height: 72, rx: 2, class: "cart-in" }, cg);
+  text(cg, 149, 40, "INFERENCE SERVING", "cart-t1", "middle");
+  text(cg, 149, 68, "推理服务全图", "cart-t2", "middle");
+  text(cg, 149, 86, "要求 · 限制 · 问题 · 解法 · 生态", "cart-t3", "middle");
+  const cp = el("g", { transform: "translate(64,512) scale(.85)" });
+  el("circle", { r: 30, class: "compass-c" }, cp); el("circle", { r: 22, class: "compass-c" }, cp);
+  for (let i = 0; i < 8; i++) {
+    const a = (i * Math.PI) / 4, L = i % 2 ? 18 : 32, w = i % 2 ? 4 : 6;
+    const tip = [Math.sin(a) * L, -Math.cos(a) * L], l = [Math.sin(a - Math.PI / 2) * w, -Math.cos(a - Math.PI / 2) * w], r = [Math.sin(a + Math.PI / 2) * w, -Math.cos(a + Math.PI / 2) * w];
+    el("path", { d: `M0,0 L${l[0]},${l[1]} L${tip[0]},${tip[1]} Z`, class: "compass-a" }, cp);
+    el("path", { d: `M0,0 L${r[0]},${r[1]} L${tip[0]},${tip[1]} Z`, class: "compass-b" }, cp);
+  }
+  text(cp, 0, -36, "N", "compass-n", "middle");
+
+  // ---------- places ----------
+  // [section id, number, name, subtitle, marker x, y, label dx, dy, anchor, onSea]
+  const PLACES = [
+    ["goals", "01", "要求与指标", "指标港 · TTFT · goodput", 106, 290, 20, -4, "start"],
+    ["limits", "02", "物理限制", "翻越 Roofline 山脉", 226, 228, 20, -4, "start"],
+    ["problems", "03", "要解决的问题", "瓶颈沼泽", 168, 420, 20, -4, "start"],
+    ["llm", "04", "LLM 核心技术", "王都", 401, 300, 0, 36, "middle"],
+    ["moe", "05", "MoE", "专家群岛", 762, 410, 40, 60, "start", true],
+    ["scale", "06", "大规模集群", "集群高原", 590, 428, 20, -4, "start"],
+    ["frameworks", "07", "推理框架", "框架城邦：vLLM · SGLang", 456, 158, 20, -4, "start"],
+    ["posttrain", "08", "后训练", "RL 环礁", 770, 140, 65, 100, "middle", true],
+    ["omni", "09", "Omni / 语音", "多阶段湖区", 846, 360, 40, 64, "middle", true],
+    ["diffusion", "10", "扩散模型", "去噪湾", 850, 614, -18, -70, "middle"],
+    ["robotics", "11", "机器人推理", "实时岬", 560, 624, 30, -60, "middle", true],
+    ["coding", "12", "Coding Agent", "Agent 港 · 长会话", 352, 630, 20, -58, "middle", true],
+    ["science", "13", "AI for Science", "科学群岛", 126, 624, 24, -56, "middle", true],
+    ["adjacent", "14", "相关技术", "Sandbox 要塞", 44, 386, -22, -60, "start", true],
+    ["landscape", "15", "公司与开源", "生态港", 340, 62, 20, -4, "start"],
+    ["source", "16", "源码导读", "藏书阁 · Code Wiki", 522, 62, 20, -4, "start"],
+    ["interview", "17", "面试速查", "灯塔", 702, 50, 20, 28, "start", true],
+    ["refs", "18", "参考文献", "图书馆", 966, 42, -20, -4, "end", true]
+  ];
+  // sub-places → subsection anchors
+  const SUBS = [
+    ["batching", "连续批处理", 322, 284, "end"], ["kv", "KV 仓库", 440, 232, "start"], ["chunked", "Chunked 驿站", 504, 276, "start"],
+    ["pd", "PD 双城", 498, 334, "start"], ["spec", "投机渡口", 470, 386, "start"], ["kernels", "Kernel 森林", 254, 352, "end"],
+    ["quant", "量化工坊", 362, 392, "start"], ["parallel", "并行运河", 420, 420, "start"], ["arch", "结构矿脉", 560, 226, "start"],
+    ["tenancy", "LoRA 集市", 548, 360, "start"]
+  ];
+  // recommended voyage through the chapters
+  const routePts = PLACES.slice(0, 17).map((p) => [p[4], p[5]]);
+  routePts.splice(14, 0, [26, 270], [70, 140], [200, 110]);  // sail around the west coast instead of crossing the continent
+  el("path", { d: smooth(routePts, false), class: "route" });
+
+  const subG = el("g", {});
+  SUBS.forEach(([id, name, x, y, anchor]) => {
+    const a = el("a", { href: "#" + id, class: "sub", "data-id": id }, subG);
+    el("circle", { cx: x, cy: y, r: 4.5, class: "town" }, a);
+    text(a, x + (anchor === "end" ? -8 : 8), y + 4.5, name, "town-name", anchor);
+  });
+  const plG = el("g", {});
+  PLACES.forEach(([id, n, name, sub, x, y, dx, dy, anchor, onSea]) => {
+    const a = el("a", { href: "#" + id, class: "place" + (onSea ? " on-sea" : ""), "data-sec": id, "aria-label": `${n} ${name}` }, plG);
+    const t = el("title", {}, a); t.textContent = `${n} ${name} · ${sub}`;
+    el("circle", { cx: x, cy: y, r: 14, class: "mk-ring" }, a);
+    el("circle", { cx: x, cy: y, r: 14, class: "mk" }, a);
+    text(a, x, y + 4, n, "mk-n", "middle");
+    text(a, x + dx, y + dy, name, "pl-name", anchor);
+    text(a, x + dx, y + dy + 17, sub, "pl-sub", anchor);
+  });
+
+  // ---------- router ----------
+  const atlas = document.getElementById("atlas");
+  const pane = document.getElementById("chapterPane");
+  const sections = [...pane.querySelectorAll(":scope > section")];
+  const crumb = document.getElementById("paneCrumb"), prev = document.getElementById("prevCh"), next = document.getElementById("nextCh");
+  const mapBtn = document.getElementById("mapBtn"), hint = document.getElementById("topHint");
+  const subIds = new Set(SUBS.map((s) => s[0]));
+  function markSub(id) { svg.querySelectorAll(".sub").forEach((s) => s.classList.toggle("here", s.getAttribute("data-id") === id)); }
+  function route() {
+    const h = decodeURIComponent(location.hash.slice(1));
+    const target = h && h !== "map" && h !== "top" ? document.getElementById(h) : null;
+    const sec = target ? (target.matches("main.chapter-pane > section") ? target : target.closest("main.chapter-pane > section")) : null;
+    svg.querySelectorAll(".place").forEach((p) => p.classList.toggle("here", !!sec && p.getAttribute("data-sec") === sec.id));
+    if (!sec) {
+      atlas.setAttribute("data-mode", "map");
+      sections.forEach((s) => s.classList.remove("active"));
+      mapBtn.hidden = true; hint.textContent = "点击地图上的地点打开章节";
+      markSub(null);
+      return;
+    }
+    atlas.setAttribute("data-mode", "split");
+    sections.forEach((s) => s.classList.toggle("active", s === sec));
+    mapBtn.hidden = false;
+    const i = sections.indexOf(sec), h2 = sec.querySelector("h2");
+    crumb.textContent = h2 ? h2.textContent.replace(/^(\d+)/, "$1 · ") : "";
+    hint.textContent = crumb.textContent;
+    const setNav = (a, s, label) => { if (s) { a.href = "#" + s.id; a.removeAttribute("aria-disabled"); a.title = s.querySelector("h2").textContent; } else { a.href = "#map"; a.setAttribute("aria-disabled", "true"); } };
+    setNav(prev, sections[i - 1]); setNav(next, sections[i + 1]);
+    markSub(subIds.has(h) ? h : null);
+    const narrow = matchMedia("(max-width: 900px)").matches;
+    requestAnimationFrame(() => {
+      if (target !== sec) target.scrollIntoView({ block: "start", behavior: "instant" });
+      else if (narrow) window.scrollTo({ top: 0, behavior: "instant" });
+      else pane.scrollTo({ top: 0, behavior: "instant" });
+    });
+  }
+  mapBtn.addEventListener("click", () => { location.hash = "map"; });
+  window.addEventListener("hashchange", route);
+  route();
+  // figures are drawn after this script runs; re-apply the scroll target once layout is final
+  const settle = () => { if (location.hash && location.hash !== "#map") route(); };
+  window.addEventListener("load", settle);
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(settle);
+  // while reading chapter 04, light up the sub-place currently on screen
+  if ("IntersectionObserver" in window) {
+    const io = new IntersectionObserver((ents) => ents.forEach((en) => { if (en.isIntersecting) markSub(en.target.id); }), { root: matchMedia("(max-width: 900px)").matches ? null : pane, rootMargin: "-10% 0px -75% 0px" });
+    SUBS.forEach(([id]) => { const t = document.getElementById(id); if (t) io.observe(t); });
+  }
+})();
+</script>

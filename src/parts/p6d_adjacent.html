@@ -1,0 +1,90 @@
+    <section id="adjacent">
+      <h2><span class="no">14</span>和 inference serving 相关的技术</h2>
+      <h3>Sandbox：让模型生成的代码和动作安全地执行</h3>
+      <p>Agent 会写代码、跑命令、开浏览器；RL 训练需要几千个并发环境跑单元测试。这些代码不可信，必须在隔离环境里执行。sandbox 已经成为 agent 产品和 RL 基础设施的标准组件。</p>
+      <figure class="figure" id="fig-sbx"><div class="fig-body"></div>
+        <figcaption><b>Agent 循环中的 sandbox。</b>模型输出工具调用，编排层把它路由到 sandbox 池中属于该会话的实例执行，结果作为下一轮输入。预热池和快照恢复负责把“开一个新环境”的时间压到毫秒到百毫秒级。</figcaption>
+      </figure>
+      <script>
+      flow("fig-sbx", { w: 980, h: 300, label: "Agent 与 sandbox", nodes: [
+        { id: "llm", x: 100, y: 150, t: "LLM 推理服务", s: "vLLM / SGLang / API", k: "acc", w: 170 },
+        { id: "ag", x: 360, y: 150, t: "Agent 编排", s: "解析 tool call\n会话状态 · 重试 · 超时", k: "warn", w: 180 },
+        { id: "mgr", x: 605, y: 150, t: "Sandbox 管理器", s: "分配 · 预热池\n快照 / 恢复 · 回收", k: "teal", w: 170 },
+        { id: "s1", x: 865, y: 60, t: "microVM / 容器 1", s: "代码执行 · 文件系统", k: "pass", w: 180 },
+        { id: "s2", x: 865, y: 150, t: "microVM / 容器 2", s: "浏览器 · 网络白名单", k: "pass", w: 180 },
+        { id: "s3", x: 865, y: 240, t: "…几千个并发", s: "SWE 仓库镜像", k: "pass", w: 180 }
+      ], edges: [
+        { f: "llm", t: "ag", k: "acc", l: "tool call" }, { f: "ag", t: "llm", k: "warn", fs: "b", ts: "b", st: true, my: 245, l: "工具结果 → 下一轮" },
+        { f: "ag", t: "mgr", k: "teal" }, { f: "mgr", t: "s1", k: "pass" }, { f: "mgr", t: "s2", k: "pass" }, { f: "mgr", t: "s3", k: "pass" }
+      ]});
+      </script>
+      <div class="table-box"><table>
+        <thead><tr><th>隔离技术</th><th>原理</th><th>启动 / 开销</th><th>隔离强度</th><th>谁在用</th></tr></thead>
+        <tbody>
+          <tr><td class="k">容器（Docker）</td><td>Linux namespace + cgroups，共享宿主内核</td><td>最快、最省</td><td>最弱（内核漏洞可逃逸）</td><td>受信任代码、内部 RL 环境</td></tr>
+          <tr><td class="k">gVisor</td><td>用户态内核拦截系统调用</td><td>较快，系统调用密集型负载有开销</td><td>中高</td><td>Modal、Google Cloud Run</td></tr>
+          <tr><td class="k">Firecracker microVM</td><td>基于 KVM 的极简 VMM（AWS Lambda 的底座）</td><td>约百毫秒级启动，单实例内存开销仅数 MB，支持快照恢复</td><td>高（硬件虚拟化）</td><td>E2B 等 agent sandbox 平台</td></tr>
+          <tr><td class="k">OpenSandbox（阿里开源）</td><td>每个 sandbox 是一个 OCI 容器，注入 Go 写的执行守护进程 execd 负责命令、文件、代码执行；统一的 sandbox API + 多语言 SDK + MCP server</td><td>Docker 本地 / Kubernetes 集群运行时，可接入更强隔离的容器运行时</td><td>取决于底层运行时</td><td>coding agent、GUI agent、agent 评测、RL 训练环境</td></tr>
+          <tr><td class="k">Kata Containers</td><td>每个容器一个轻量 VM</td><td>中</td><td>高</td><td>K8s 多租户</td></tr>
+          <tr><td class="k">WebAssembly / V8 isolate</td><td>语言运行时级隔离</td><td>毫秒级</td><td>中（能力受限）</td><td>浏览器内 Python（Pyodide）、边缘函数</td></tr>
+        </tbody>
+      </table></div>
+      <ul class="facts">
+        <li><b>关键需求：</b>冷启动（预热池、快照 / 恢复、CRIU）、密度（单机几百上千个）、网络出口控制、文件系统持久化与暂停 / 恢复（长时 agent 会话）、资源限额与超时、可观测性。</li>
+        <li><b>开源平台：</b>OpenSandbox（阿里开源，仓库现位于 opensandbox-group 组织）提供统一 sandbox API、Python / Java / JS / C# / Go SDK、CLI 与 MCP server，并带有 Claude Code、Gemini CLI、Codex CLI 等 coding agent 的接入示例；E2B 也开源了 SDK 与基础设施代码。</li>
+        <li><b>服务商：</b>E2B、Modal Sandboxes、Daytona、Runloop、Northflank、Cloudflare Sandbox / Containers、Vercel Sandbox 等；模型厂商自带的代码执行工具（OpenAI Code Interpreter、Anthropic code execution tool）。</li>
+        <li><b>开源：</b>Firecracker、gVisor、Kata；面向 agent 的运行时如 OpenSandbox、OpenHands runtime、SWE-ReX。</li>
+      </ul>
+      <div class="srcs"><span class="srcs-label">源码</span>{{r:opensandbox-group/OpenSandbox|OpenSandbox}}{{s:opensandbox-group/OpenSandbox:components/execd|execd 守护进程}}{{s:opensandbox-group/OpenSandbox:server|server}}{{s:opensandbox-group/OpenSandbox:kubernetes|kubernetes}}{{s:opensandbox-group/OpenSandbox:examples|examples（各 coding CLI 接入）}}{{s:e2b-dev/E2B:packages|E2B packages/}}{{s:firecracker-microvm/firecracker:src/firecracker/src/api_server/request/snapshot.rs|Firecracker 快照 API}}{{s:google/gvisor:runsc/sandbox|gVisor runsc/sandbox}}{{s:google/gvisor:pkg/sentry/syscalls|gVisor 系统调用实现}}{{s:SWE-agent/SWE-ReX:src/swerex/deployment|SWE-ReX}}{{w:opensandbox-group/OpenSandbox|OpenSandbox · Code Wiki}}{{w:firecracker-microvm/firecracker|Firecracker · Code Wiki}}</div>
+      <h3>API 网关、模型路由与缓存</h3>
+      <ul class="facts">
+        <li><b>统一网关：</b>LiteLLM（开源代理，统一上百家供应商的 OpenAI 兼容接口）、OpenRouter（模型市场与路由）、Portkey、Kong AI Gateway、Envoy AI Gateway、Cloudflare AI Gateway。负责鉴权、按 token 限流（TPM / RPM）、配额、计费、重试与 fallback。</li>
+        <li><b>模型路由：</b>按问题难度选模型以省钱（RouteLLM、vLLM Semantic Router）；按地域、价格、延迟选供应商。</li>
+        <li><b>缓存：</b>精确缓存、语义缓存（向量相似度命中，需谨慎）、供应商侧的 prompt caching。</li>
+        <li><b>多租户安全：</b>前缀缓存可能被用作跨租户的时序侧信道（命中更快），可以按租户加 cache salt 隔离（vLLM 支持 <code>cache_salt</code>）。</li>
+      </ul>
+
+      <div class="srcs"><span class="srcs-label">源码</span>{{s:BerriAI/litellm:litellm/router.py|LiteLLM router.py}}{{s:BerriAI/litellm:litellm/proxy|LiteLLM proxy/}}{{r:vllm-project/semantic-router|vLLM Semantic Router}}</div>
+      <h3>可观测性、压测与评测</h3>
+      <div class="table-box"><table>
+        <thead><tr><th>类别</th><th>工具</th><th>用途</th></tr></thead>
+        <tbody>
+          <tr><td class="k">引擎指标</td><td>vLLM / SGLang 的 Prometheus 指标、NVIDIA DCGM</td><td>队列长度、KV 使用率、TTFT / ITL 直方图、前缀命中率、GPU 功耗与温度</td></tr>
+          <tr><td class="k">链路追踪</td><td>OpenTelemetry（GenAI 语义约定）</td><td>每个请求的排队、prefill、decode 分段耗时</td></tr>
+          <tr><td class="k">LLM 应用观测</td><td>Langfuse、LangSmith、Helicone、Arize Phoenix</td><td>prompt、成本、质量追踪</td></tr>
+          <tr><td class="k">性能剖析</td><td>PyTorch Profiler、Nsight Systems / Compute</td><td>找 GPU 空泡、慢 kernel、CPU 瓶颈</td></tr>
+          <tr><td class="k">压测</td><td><code>vllm bench serve</code>、<code>sglang.bench_serving</code>、NVIDIA AIPerf（GenAI-Perf 后继）、guidellm、LLMPerf</td><td>按到达率 / 并发扫描，画吞吐–延迟曲线</td></tr>
+          <tr><td class="k">行业基准</td><td>MLPerf Inference（MLCommons）、SemiAnalysis InferenceMAX、Artificial Analysis</td><td>硬件 / 软件栈对比、API 供应商速度与价格对比</td></tr>
+          <tr><td class="k">精度评测</td><td>lm-evaluation-harness、OpenCompass、EvalScope</td><td>量化、投机、新 kernel 上线前的回归</td></tr>
+        </tbody>
+      </table></div>
+
+      <div class="srcs"><span class="srcs-label">源码</span>{{r:vllm-project/guidellm|guidellm}}{{s:ai-dynamo/aiperf:src/aiperf|AIPerf}}{{r:EleutherAI/lm-evaluation-harness|lm-evaluation-harness}}{{s:vllm-project/vllm:benchmarks|vLLM benchmarks/}}{{s:sgl-project/sglang:python/sglang/bench_serving.py|sglang bench_serving.py}}</div>
+      <h3>模型加载、分发与冷启动</h3>
+      <ul class="facts">
+        <li><b>格式：</b>safetensors（可 mmap、零拷贝、无反序列化风险）、GGUF（llama.cpp）。</li>
+        <li><b>加速加载：</b>Run:ai Model Streamer、fastsafetensors、CoreWeave tensorizer、GPUDirect Storage；权重预置到节点本地 NVMe；节点间 P2P 分发（如 Dragonfly）。</li>
+        <li><b>镜像：</b>推理镜像动辄几十 GB，用懒加载镜像（eStargz、Nydus）或预拉取。</li>
+        <li><b>快照：</b>进程级 / GPU 显存级快照恢复，把“加载 + 编译 + 预热”的分钟级冷启动压到秒级。</li>
+      </ul>
+
+      <h3>安全与合规</h3>
+      <ul class="facts">
+        <li>内容安全分类器（Llama Guard、ShieldGemma、NeMo Guardrails）与主模型并行或流式运行，避免串行增加延迟。</li>
+        <li>Prompt injection 防护（尤其 agent 读取外部内容时）、PII 脱敏、日志留存策略。</li>
+        <li>机密计算（H100 / Blackwell 的 Confidential Computing 模式）用于敏感数据推理。</li>
+      </ul>
+
+      <h3>硬件与编译器生态（简表）</h3>
+      <div class="table-box"><table>
+        <thead><tr><th>层</th><th>代表</th></tr></thead>
+        <tbody>
+          <tr><td class="k">GPU</td><td>NVIDIA Hopper / Blackwell（CUDA）、AMD Instinct MI300 / MI350（ROCm）、Intel Gaudi / Arc（XPU）、摩尔线程（MUSA）</td></tr>
+          <tr><td class="k">云厂商自研芯片</td><td>Google TPU、AWS Trainium / Inferentia、Microsoft Maia、Meta MTIA</td></tr>
+          <tr><td class="k">推理专用架构</td><td>Groq LPU（SRAM 为主、确定性调度；2025 年底 NVIDIA 与其达成技术授权并吸纳核心团队）、Cerebras（晶圆级）、SambaNova（可重构数据流）、Etched（Transformer ASIC）</td></tr>
+          <tr><td class="k">国内加速器</td><td>华为昇腾（CANN / MindIE，vllm-ascend）、寒武纪、海光、摩尔线程、沐曦等</td></tr>
+          <tr><td class="k">Kernel 语言与库</td><td>CUDA、CUTLASS / CuTe DSL、Triton、TileLang、ThunderKittens；cuBLAS、FlashAttention、FlashInfer、DeepGEMM、NCCL / NVSHMEM</td></tr>
+          <tr><td class="k">图编译</td><td>torch.compile（Inductor）、TensorRT、XLA（JAX / TPU）、TVM、MLIR 系</td></tr>
+        </tbody>
+      </table></div>
+    </section>

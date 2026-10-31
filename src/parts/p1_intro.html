@@ -1,0 +1,281 @@
+<body>
+<header class="topbar">
+  <a class="brand" href="#map">Inference Serving <span>全景图</span></a><span class="topbar-by">by kzhoulatte</span>
+  <span class="topbar-hint" id="topHint">点击地图上的地点打开章节</span>
+  <button class="theme-btn" id="mapBtn" type="button" hidden>⤢ 地图</button>
+  <button class="theme-btn" id="themeBtn" type="button">深浅色</button>
+</header>
+<div class="atlas" id="atlas" data-mode="map">
+  <div class="map-pane" id="mapPane">
+    <div class="map-intro">
+      <p class="eyebrow">Interview prep · inference serving</p>
+      <h1>Inference Serving 全景：从指标、瓶颈到框架与生态</h1>
+      <p class="byline">作者 <b>kzhoulatte</b> · 2026 年 10 月 · 第 1 版</p>
+      <p class="lede">这是一张“推理服务大陆”的地图：西岸的港口是起点（指标），翻过 Roofline 山脉（物理限制）、穿过瓶颈沼泽（要解决的问题），到达王都（LLM 核心技术）；向东是 MoE 群岛和集群高原；海上的岛屿是换了负载之后的世界：后训练、Omni、扩散、机器人、Coding Agent、AI for Science；沿西海岸北上是 Sandbox 要塞、生态港、藏书阁（源码导读）和面试灯塔。红色虚线是推荐航线。点击任意地点，章节会在右侧打开。</p>
+    </div>
+    <figure class="map-fig">
+      <svg id="atlasMap" viewBox="0 0 1000 700" role="img" aria-label="推理服务全景地图"></svg>
+    </figure>
+    <div class="map-legend">
+      <span><i class="lg-mk">01</i>章节（点击打开）</span>
+      <span><i class="lg-dot"></i>小节</span>
+      <span><i class="lg-route"></i>推荐阅读航线</span>
+      <span class="meta-note">© 2026 kzhoulatte · 个人学习与面试准备笔记，内容整理自公开论文、文档与开源代码，观点仅代表作者本人；知识截止约 2026 年中，引用或转载请注明作者与出处</span>
+    </div>
+  </div>
+
+  <main class="chapter-pane" id="chapterPane">
+    <div class="pane-bar">
+      <a class="pane-back" href="#map">← 地图</a>
+      <span class="pane-crumb" id="paneCrumb"></span>
+      <span class="pane-nav"><a id="prevCh" href="#map">‹ 上一章</a><a id="nextCh" href="#map">下一章 ›</a></span>
+    </div>
+
+    <section id="goals">
+      <h2><span class="no">01</span>推理服务本身：要求与指标</h2>
+      <p>Inference serving 的任务是把训练好的模型变成一个服务：接收请求、在加速器上跑前向、把结果（常常是流式地）返回。它要同时满足三类目标，而这三类目标互相拉扯：</p>
+      <div class="cards">
+        <div class="card"><h4>延迟（用户体验）</h4><p>第一个 token 多快出来，之后每个 token 隔多久，整条回答多久结束。看的是 p50 / p90 / p99，不是平均值。</p></div>
+        <div class="card pass"><h4>吞吐与成本（经济性）</h4><p>每块 GPU 每秒能产出多少 token，折算成每百万 token 的成本。批越大吞吐越高，但单请求越慢。</p></div>
+        <div class="card warn"><h4>质量与可靠性</h4><p>量化、投机解码、近似 cache 不能让输出变差；服务要可用、可扩缩、能抗突发流量、能隔离租户。</p></div>
+      </div>
+
+      <h3>四种典型场景</h3>
+      <div class="table-box"><table>
+        <thead><tr><th>场景</th><th>例子</th><th>最在意</th><th>可以牺牲</th></tr></thead>
+        <tbody>
+          <tr><td class="k">在线交互</td><td>Chat、Copilot 补全</td><td>TTFT、TPOT 的 p99，流式输出</td><td>一部分吞吐（批不能太大）</td></tr>
+          <tr><td class="k">Agent / 长上下文</td><td>编码 agent、多轮工具调用、RAG</td><td>长 prompt 的 prefill 速度、前缀 cache 命中率、端到端完成时间</td><td>单 token 延迟可略放宽</td></tr>
+          <tr><td class="k">离线批处理</td><td>数据合成、评测、Batch API、RL rollout</td><td>总吞吐、每 token 成本</td><td>延迟几乎无所谓（RL 例外：长尾会拖慢整个 step）</td></tr>
+          <tr><td class="k">实时流式</td><td>语音对话、同传、机器人控制</td><td>首包延迟、稳定的输出节奏（不能卡顿）、抖动</td><td>峰值吞吐；常常 batch=1</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>一个请求的生命周期</h3>
+      <p>以 OpenAI 兼容的 <code>/v1/chat/completions</code> 流式请求为例。前端进程做 HTTP、chat template、tokenize；调度器决定这一步让哪些请求上 GPU；model runner 跑前向；sampler 采样；detokenizer 把 token 变回文本，经 SSE 流回客户端。</p>
+      <figure class="figure" id="fig-life"><div class="fig-body"></div>
+        <figcaption><b>请求路径。</b>绿色虚线是每个 decode step 的循环：调度 → 前向 → 采样 → 流式返回，直到 EOS 或 max_tokens。CPU 侧（API、tokenize、调度）若慢，会直接表现为 GPU 空转。</figcaption>
+      </figure>
+      <script>
+      flow("fig-life", { w: 960, h: 340, label: "LLM 请求生命周期", nodes: [
+        { id: "c", x: 70, y: 150, t: "Client", s: "HTTP / SSE", w: 110 },
+        { id: "api", x: 240, y: 150, t: "API server", s: "鉴权 · chat template\ntokenize", k: "acc", w: 150 },
+        { id: "q", x: 420, y: 150, t: "Waiting queue", s: "排队 / 优先级", w: 140 },
+        { id: "sch", x: 600, y: 150, t: "Scheduler", s: "选本步的 batch\n分配 KV block", k: "acc", w: 150 },
+        { id: "kv", x: 600, y: 42, t: "KV cache manager", s: "block 表 · 前缀 cache", k: "warn", w: 170 },
+        { id: "run", x: 820, y: 150, t: "Model runner", s: "prefill / decode 前向\nCUDA graph", k: "pass", w: 160 },
+        { id: "smp", x: 820, y: 262, t: "Sampler", s: "logits 处理 · 采样\n结构化约束", k: "pass", w: 160 },
+        { id: "det", x: 420, y: 262, t: "Detokenizer", s: "增量 detokenize\n停止词检查", k: "acc", w: 150 },
+        { id: "out", x: 200, y: 262, t: "流式输出", s: "SSE chunk", w: 120 }
+      ], edges: [
+        { f: "c", t: "api", k: "acc" }, { f: "api", t: "q" }, { f: "q", t: "sch" }, { f: "sch", t: "run", k: "pass" },
+        { f: "sch", t: "kv", k: "warn", both: true, l: "alloc / free" }, { f: "run", t: "smp", k: "pass" },
+        { f: "smp", t: "sch", k: "pass", a: true, st: true, fs: "l", ts: "b", fo: -10, l: "下一步 decode" },
+        { f: "smp", t: "det", k: "acc", st: true, fs: "b", ts: "b", my: 318, l: "新 token" }, { f: "det", t: "out", k: "acc" }, { f: "out", t: "c", k: "acc", fs: "l", ts: "b", st: true }
+      ]});
+      </script>
+
+      <h3>核心指标定义</h3>
+      <div class="table-box"><table>
+        <thead><tr><th>指标</th><th>全称</th><th>定义</th><th>主要受什么影响</th></tr></thead>
+        <tbody>
+          <tr><td class="k">TTFT</td><td>Time To First Token</td><td>请求到达 → 第一个输出 token 返回。包括排队、prefill、第一次采样。</td><td>prompt 长度、排队、prefill 算力、前缀 cache 命中</td></tr>
+          <tr><td class="k">TPOT / ITL</td><td>Time Per Output Token / Inter-Token Latency</td><td>TPOT = (E2E − TTFT)/(n_out − 1)，是单请求的平均值；ITL 是相邻两个 token 的间隔分布，能看出卡顿。</td><td>decode 批大小、显存带宽、被 prefill 打断</td></tr>
+          <tr><td class="k">E2E latency</td><td>End-to-end latency</td><td>请求到达 → 最后一个 token。≈ TTFT + (n_out − 1) × TPOT。</td><td>输出长度（推理模型 CoT 很长）</td></tr>
+          <tr><td class="k">Throughput</td><td>吞吐</td><td>输出 token/s、总 token/s（含输入）、请求/s。常按每 GPU 归一化。</td><td>批大小、kernel 效率、显存能容纳多少并发</td></tr>
+          <tr><td class="k">Interactivity</td><td>tokens/s/user</td><td>单个用户看到的生成速度 = 1/TPOT。和每 GPU 吞吐构成 Pareto 曲线。</td><td>同上，方向相反</td></tr>
+          <tr><td class="k">Goodput</td><td>满足 SLO 的吞吐</td><td>只统计 TTFT 和 TPOT 都满足 SLO 的请求的吞吐（DistServe 提出的口径）。比裸吞吐更接近“能卖的产能”。</td><td>尾延迟、P/D 干扰</td></tr>
+          <tr><td class="k">SLO attainment</td><td>SLO 达成率</td><td>满足 SLO 的请求占比，例如 “99% 请求 TTFT &lt; 2 s 且 TPOT &lt; 50 ms”。</td><td>负载、调度策略</td></tr>
+          <tr><td class="k">MFU / MBU</td><td>Model FLOPs / Bandwidth Utilization</td><td>MFU = 实际 FLOP/s ÷ 峰值 FLOP/s（prefill 看它）；MBU = 实际字节/s ÷ 峰值带宽（decode 看它）。</td><td>kernel 质量、批大小、CPU 开销</td></tr>
+          <tr><td class="k">$/1M tokens</td><td>单位成本</td><td>GPU 小时价 ÷ (每 GPU 每小时产出 token / 10⁶)。输入、输出、缓存命中的输入通常分别计价。</td><td>吞吐、硬件价格、利用率（空闲时间也要付钱）</td></tr>
+          <tr><td class="k">其他运营指标</td><td></td><td>排队时间、抢占 / 重算次数、前缀 cache 命中率、KV 使用率、错误率、冷启动时间、可用性。</td><td></td></tr>
+        </tbody>
+      </table></div>
+
+      <figure class="figure" id="fig-timeline"><div class="fig-body"></div>
+        <figcaption><b>单个请求的时间线。</b>TTFT 包含排队 + prefill；之后每个 decode step 产出一个 token。第 3 个 token 前那段长间隔是被别人的 prefill 打断（ITL 尖峰），这就是 chunked prefill 和 PD 分离要解决的问题。</figcaption>
+      </figure>
+      <script>
+      gantt("fig-timeline", { w: 940, max: 100, labelW: 110, rows: ["请求 A"], rowH: 34, top: 40, bottom: 44, ticks: 10, tickLabels: false, axis: "时间 →（示意，每格一个 decode step 量级）", bottom: 52, bars: [
+        { r: 0, s: 0, e: 12, t: "排队", k: "m" }, { r: 0, s: 12, e: 34, t: "prefill", k: "acc" },
+        { r: 0, s: 34, e: 40, t: "d1", k: "pass" }, { r: 0, s: 40, e: 46, t: "d2", k: "pass" }, { r: 0, s: 46, e: 66, t: "被 B 的 prefill 打断", k: "warns" },
+        { r: 0, s: 66, e: 72, t: "d3", k: "pass" }, { r: 0, s: 72, e: 78, t: "d4", k: "pass" }, { r: 0, s: 78, e: 84, t: "d5", k: "pass" }, { r: 0, s: 84, e: 90, t: "EOS", k: "pass" }
+      ], marks: [
+        { r: 0, s: 0, e: 34, t: "TTFT", k: "acc" }, { r: 0, s: 46, e: 72, t: "ITL 尖峰", k: "warn" }, { r: 0, s: 0, e: 90, t: "E2E latency", k: "todo", below: true }
+      ]});
+      </script>
+
+      <h3>吞吐和延迟的权衡：Pareto 曲线</h3>
+      <p>decode 一步的耗时近似是 <code>t(B) ≈ t₀ + c·B</code>：<code>t₀</code> 是把权重读一遍的固定成本，<code>c·B</code> 是随批大小增长的部分（读各自的 KV、计算）。于是批大小 B 越大，每 GPU 吞吐 <code>B/t(B)</code> 越高，但每用户速度 <code>1/t(B)</code> 越低。SemiAnalysis 的 InferenceMAX 等基准就是把这条曲线画出来比较。</p>
+      <figure class="figure" id="fig-pareto"><div class="fig-body"></div>
+        <figcaption><b>示意曲线（非实测）。</b>曲线上每个位置对应一个批大小：左上是大批（吞吐高、每用户慢），右下是小批。SLO 要求每用户 ≥ 50 tok/s（TPOT ≤ 20 ms）时，应选 SLO 线右侧吞吐最高的点；优化（更好的 kernel、FP8、投机解码）把整条曲线往右上推。</figcaption>
+      </figure>
+      <script>
+      (function () {
+        // Illustrative concave frontier: throughput saturates when the batch is large, per-user speed collapses.
+        const mk = (T, U) => { const p = []; for (let u = 6; u <= U; u += 2) p.push([u, T * (1 - Math.pow(u / U, 2))]); p.push([U, 0]); return p; };
+        const a = mk(11000, 130), b = mk(15000, 165);
+        const ya = 11000 * (1 - Math.pow(50 / 130, 2)), yb = 15000 * (1 - Math.pow(50 / 165, 2));
+        chart("fig-pareto", { w: 900, h: 360, left: 74, xr: [0, 170], yr: [0, 16000], xticks: [0, 25, 50, 75, 100, 125, 150], yticks: [0, 4000, 8000, 12000, 16000], yfmt: (v) => (v / 1000) + "k",
+          xlabel: "每用户速度 tokens/s/user（= 1/TPOT）→ 越右越快", ylabel: "每 GPU 吞吐 tokens/s/GPU",
+          series: [
+            { pts: [[50, 0], [50, 16000]], k: "m" },
+            { pts: a, k: "acc", t: "基线", tx: 112, ty: 11000 * (1 - Math.pow(112 / 130, 2)), dx: 8 },
+            { pts: b, k: "pass", t: "优化后", tx: 140, ty: 15000 * (1 - Math.pow(140 / 165, 2)), dx: 8 }
+          ],
+          points: [
+            { x: 50, y: ya, k: "acc", t: "SLO 内最高 ≈ 9.4k", dx: 10, dy: 16 },
+            { x: 50, y: yb, k: "pass", t: "≈ 13.6k", dx: 10, dy: -6 }
+          ],
+          notes: [{ x: 52, y: 15300, t: "SLO：TPOT ≤ 20 ms（每用户 ≥ 50 tok/s）", k: "m" }, { x: 100, y: 1500, t: "批小：快但贵", k: "m" }, { x: 3, y: 9200, t: "批大：便宜但慢", k: "m" }]
+        });
+      })();
+      </script>
+
+      <h3>两条要背下来的关系式</h3>
+      <div class="formula">E2E ≈ TTFT + (n_out − 1) × TPOT
+并发数 L = 到达率 λ × 平均停留时间 W          <span style="color:var(--muted)"># Little's law</span>
+例：每秒 20 个请求，每个平均 15 s 才结束 → 系统里稳态约 300 个并发请求，KV cache 要装得下这 300 个</div>
+      <div class="callout"><b class="h">SLO 的常见量级（经验值，因产品而异）</b>
+        <ul>
+          <li>人的阅读速度约 4–8 token/s，所以聊天的 TPOT 在 30–100 ms 之间体验上差别不大；但 agent 和推理模型输出很长，TPOT 直接决定完成时间，所以“每用户速度”越来越受重视。</li>
+          <li>语音对话要求首包音频在几百毫秒内出来；代码补全要求整段补全几百毫秒内完成。</li>
+          <li>离线任务的 SLO 是“今晚跑完”，只看成本。</li>
+        </ul>
+      </div>
+
+      <h3>负载画像决定优化方向</h3>
+      <ul class="facts">
+        <li><b>ISL / OSL（输入 / 输出长度）。</b>RAG、摘要、agent 是长输入短输出（prefill 重）；推理模型（o1 / R1 类）是短输入长输出（decode 重）。基准测试一定要说明长度分布。</li>
+        <li><b>前缀共享。</b>系统 prompt、few-shot、多轮对话历史、agent 的工具定义，都让大量请求共享前缀 → 前缀 cache 命中率可以很高（官方 API 对 cached input 打折就是这个原因）。</li>
+        <li><b>到达模式。</b>泊松到达 vs 突发；闭环（固定并发，发完一个再发下一个）vs 开环（按速率发）。闭环测试会掩盖排队问题。</li>
+        <li><b>多轮与会话。</b>同一会话的下一轮要能找到上一轮的 KV，这影响路由（会话粘性 / KV 感知路由）。</li>
+      </ul>
+
+      <h3>不同应用场景的推理负载画像</h3>
+      <p>同样叫“推理”，不同场景的模型结构不同、用户需求不同，落到 GPU 上的负载形状就完全不同。下表是全文的索引：每一行在对应章节里都有“模型特征 → 场景 → 负载”的详细拆解。</p>
+      <div class="table-box"><table>
+        <thead><tr><th>场景</th><th>典型输入 / 输出</th><th>并发与批</th><th>延迟目标</th><th>跨步状态</th><th>主要瓶颈</th><th>关键技术</th></tr></thead>
+        <tbody>
+          <tr><td class="k"><a href="#llm">在线聊天</a></td><td>1–8k / 几百</td><td>高并发，大批</td><td>TTFT 秒内，TPOT 几十 ms</td><td>KV cache</td><td>decode 带宽、KV 容量</td><td>连续批、paged KV、前缀 cache、量化</td></tr>
+          <tr><td class="k"><a href="#posttrain">推理模型 / RL rollout</a></td><td>短 / 数千到数万</td><td>极大批，离线</td><td>step 时间（看长尾）</td><td>KV + 每步更新的权重</td><td>长尾、权重同步、训推不一致</td><td>异步 RL、partial rollout、确定性 kernel</td></tr>
+          <tr><td class="k"><a href="#coding">Coding agent</a></td><td>5–20 万（逐轮增长）/ 每轮数百到数千</td><td>中等并发，长会话</td><td>每轮 TTFT、tokens/s/user</td><td>跨工具调用保留的 KV</td><td>长 prefill、KV 保留与命中率</td><td>前缀 cache、KV 分层、会话粘性路由、sandbox</td></tr>
+          <tr><td class="k"><a href="#moe">超大 MoE</a></td><td>同聊天</td><td>需要极大全局批</td><td>同聊天</td><td>KV（常为 MLA）</td><td>all-to-all、专家不均、小 GEMM</td><td>宽 EP、DP attention、DeepEP、EPLB、TBO</td></tr>
+          <tr><td class="k"><a href="#omni">Omni / 语音</a></td><td>音频 / 图像 + 文本 / 流式音频</td><td>中等，按阶段不同</td><td>首包几百 ms，RTF &lt; 1</td><td>多阶段 KV + 会话状态</td><td>阶段间流水、小模型高频 decode</td><td>阶段化运行时、chunk 交接、CUDA graph</td></tr>
+          <tr><td class="k"><a href="#diffusion">图像 / 视频扩散</a></td><td>prompt / 数千到数万 latent token × N 步</td><td>小批</td><td>秒到分钟</td><td>无 KV（步间特征相似）</td><td>算力、超长序列 attention</td><td>蒸馏、特征缓存、序列并行、稀疏 attention</td></tr>
+          <tr><td class="k"><a href="#robotics">机器人</a></td><td>多相机 + 指令 / 动作块</td><td>batch = 1（每台）</td><td>控制周期内，看最坏情况</td><td>动作缓冲区</td><td>prefill 延迟、抖动、边缘算力</td><td>action chunk、异步 + RTC、快慢双系统</td></tr>
+          <tr><td class="k"><a href="#science">AI for Science</a></td><td>序列 / MSA / 原子图 / 气象场</td><td>batch = 1 或天然大批</td><td>多为离线作业</td><td>成对表示、MD 状态</td><td>N² 显存、CPU 预处理、精度</td><td>分块、三角 / 等变 kernel、MSA 缓存</td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
+    <section id="limits">
+      <h2><span class="no">02</span>物理限制：为什么 LLM 推理难</h2>
+      <p>所有优化技术都是在和下面几条硬约束周旋。面试里能把这几条讲清楚并给出数量级，比背技术名词有用得多。</p>
+
+      <h3>限制 1：自回归，token 只能一个一个生成</h3>
+      <p>第 t+1 个 token 依赖第 t 个 token 的采样结果，所以 decode 无法在时间维度并行。一个 1000 token 的回答至少要 1000 次串行前向。并行只能来自三处：同时服务多个请求（批）、一次猜多个 token 再验证（投机解码）、或者换模型（多 token 预测、扩散 LM）。</p>
+
+      <h3>限制 2：prefill 吃算力，decode 吃带宽</h3>
+      <p>一次前向对每个参数大约做 2 次浮点运算（乘 + 加）。设权重 BF16（每参数 2 字节），处理 <code>n</code> 个 token：</p>
+      <div class="formula">FLOPs ≈ 2 × N_params × n          读权重字节 ≈ 2 × N_params
+算术强度 (arithmetic intensity) ≈ FLOPs / Bytes ≈ n      <span style="color:var(--muted)"># 单位 FLOP/byte，只算权重</span>
+
+H100 SXM：BF16 稠密峰值 ≈ 989 TFLOP/s，HBM3 带宽 ≈ 3.35 TB/s
+脊点 (ridge point) ≈ 989e12 / 3.35e12 ≈ 295 FLOP/byte
+→ 一次前向里同时处理的 token 数 n &lt; ~300 时受带宽限制，&gt; ~300 时受算力限制</div>
+      <ul class="facts">
+        <li><b>Prefill</b>：一个 2000 token 的 prompt 一次前向就处理 2000 个 token，强度远超脊点，是 <b>compute-bound</b>。</li>
+        <li><b>Decode</b>：每个请求每步只处理 1 个 token。批大小 B 的 decode 对权重的强度约为 B，B 不到几百就是 <b>memory-bound</b>。更糟的是 attention 部分要读每个请求自己的 KV cache，这部分<b>不能</b>被批摊薄，强度始终约为 1。</li>
+        <li>推论：decode 的 batch=1 速度上限 ≈ 带宽 / 权重字节。8B 模型 BF16 约 16 GB，H100 上每步 ≥ 4.8 ms，即单流最多约 200 token/s（还没算 KV）。</li>
+      </ul>
+      <figure class="figure" id="fig-roof"><div class="fig-body"></div>
+        <figcaption><b>H100 roofline（对数坐标，示意）。</b>斜线是带宽屋顶（3.35 TB/s × 强度），平线是算力屋顶。decode 的点在斜线上：加大批会沿斜线往右上走，直到碰到脊点；attention 读 KV 的部分一直卡在左下角。FP8 抬高算力屋顶，同时让每参数只占 1 字节、等效带宽翻倍。</figcaption>
+      </figure>
+      <script>
+      (function () {
+        const bw = 3.35, bf = 989, f8 = 1979;
+        chart("fig-roof", { w: 900, h: 380, left: 70, xlog: true, ylog: true, xr: [0.5, 5000], yr: [1, 4000],
+          xticks: [1, 10, 100, 1000], xfmt: (v) => v + "", yticks: [1, 10, 100, 1000], yfmt: (v) => v + "",
+          xlabel: "算术强度 FLOP/byte（≈ 一次前向里同时处理的 token 数）", ylabel: "可达 TFLOP/s",
+          series: [
+            { pts: [[0.5, bw * 0.5], [bf / bw, bf], [5000, bf]], k: "acc", t: "BF16 屋顶 989 TF", tx: 700, ty: bf, dy: -8, a: "middle" },
+            { pts: [[bf / bw, bf], [f8 / bw, f8], [5000, f8]], k: "pass", t: "FP8 屋顶 1979 TF", tx: 1600, ty: f8, dy: -8, a: "middle" },
+            { pts: [[bf / bw, 1], [bf / bw, bf]], k: "m" }
+          ],
+          points: [
+            { x: 1, y: bw * 1, k: "todo", t: "decode B=1\n≈3 TF（<1% 峰值）", dx: -10, dy: -18, a: "end" },
+            { x: 32, y: bw * 32, k: "warn", t: "decode B=32" },
+            { x: 128, y: bw * 128, k: "warn", t: "decode B=128", dx: -10, dy: -8, a: "end" },
+            { x: 2000, y: bf * 0.7, k: "pass", t: "prefill 2k tokens\n（实际约 60–75% 峰值）", dx: -10, dy: 26, a: "end" }
+          ],
+          notes: [{ x: 310, y: 1.6, t: "脊点 ≈ 295", k: "m" }, { x: 1.4, y: 1.5, t: "attention 读 KV：强度≈1，批不能摊薄", k: "todo" }]
+        });
+      })();
+      </script>
+
+      <h3>限制 3：KV cache 吃显存，而且随并发和上下文线性增长</h3>
+      <p>为了不重复计算历史 token，每层的 Key / Value 要缓存下来。每个 token 的 KV 大小：</p>
+      <div class="formula">KV bytes / token = 2 (K和V) × n_layers × n_kv_heads × head_dim × bytes_per_elem
+总 KV = 上式 × Σ 每个并发请求的 (输入 + 已生成) token 数</div>
+      <div class="table-box"><table class="num">
+        <thead><tr><th>模型</th><th>结构</th><th>每 token KV（BF16）</th><th>一个 32k 上下文的请求</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Llama-3-8B</td><td>32 层，GQA 8 个 KV head，head_dim 128</td><td>2×32×8×128×2 = 128 KiB</td><td>4 GiB</td></tr>
+          <tr><td class="k">Llama-3-70B</td><td>80 层，GQA 8 KV head，head_dim 128</td><td>320 KiB</td><td>10 GiB</td></tr>
+          <tr><td class="k">Qwen3-30B-A3B</td><td>48 层，GQA 4 KV head，head_dim 128</td><td>96 KiB</td><td>3 GiB</td></tr>
+          <tr><td class="k">DeepSeek-V3</td><td>61 层，MLA：每层只存 512 维压缩 latent + 64 维 RoPE key</td><td>576×61×2 ≈ 69 KiB</td><td>≈ 2.1 GiB（671B 模型却比 8B 的 Llama 还小）</td></tr>
+        </tbody>
+      </table></div>
+      <p>一块 80 GB 的 H100 跑 Llama-3-8B（BF16）的显存账大致如下。KV 池决定了最大并发：约 52 GB ÷ 128 KiB ≈ 40 万 token，平均每请求 4k token 时约 100 个并发。并发上不去，批就大不了，decode 就一直在带宽屋顶的低处。</p>
+      <div class="membar" role="img" aria-label="H100 80GB 显存分配：权重16GB，激活与workspace约4GB，CUDA graph与其他约2GB，KV cache约52GB，预留约6GB">
+        <div style="flex:16;background:var(--accent)">权重 16 GB</div>
+        <div style="flex:4;background:var(--vio)">激活 ~4</div>
+        <div style="flex:2;background:var(--muted)">~2</div>
+        <div style="flex:52;background:var(--pass)">KV cache 池 ≈ 52 GB</div>
+        <div style="flex:6;background:var(--line);color:var(--ink)">预留</div>
+      </div>
+      <div class="memleg"><span><i style="background:var(--accent)"></i>模型权重</span><span><i style="background:var(--vio)"></i>激活 / workspace（随 max_num_batched_tokens 变化）</span><span><i style="background:var(--muted)"></i>CUDA graph、NCCL buffer 等</span><span><i style="background:var(--pass)"></i>KV cache（vLLM 的 gpu_memory_utilization 默认 0.9）</span></div>
+
+      <h3>限制 4：互联带宽比显存带宽低一到两个数量级</h3>
+      <p>模型放不进一张卡就要切分，而切分后的通信走的链路越来越慢。设计并行策略的原则是：通信最频繁的切分（TP）放在最快的链路（NVLink）里。</p>
+      <div class="table-box"><table class="num">
+        <thead><tr><th>链路</th><th>量级（单 GPU，单向约值）</th><th>用来做什么</th></tr></thead>
+        <tbody>
+          <tr><td class="k">HBM（片上显存）</td><td>3.35 TB/s（H100）→ 8 TB/s（B200）</td><td>读权重、读 KV</td></tr>
+          <tr><td class="k">NVLink（机内）</td><td>H100 NVLink4 约 450 GB/s 单向（900 GB/s 双向）；Blackwell NVLink5 翻倍</td><td>TP 的 all-reduce、机内 EP</td></tr>
+          <tr><td class="k">PCIe Gen5 x16</td><td>约 64 GB/s</td><td>CPU↔GPU、KV offload 到内存</td></tr>
+          <tr><td class="k">InfiniBand / RoCE</td><td>400 Gb/s ≈ 50 GB/s 每网卡（通常 1 GPU 配 1 网卡）</td><td>跨机 PP / EP、PD 分离的 KV 传输</td></tr>
+          <tr><td class="k">NVL72 机柜</td><td>72 块 GPU 在一个 NVLink 域内</td><td>让超大 MoE 的 EP 也走 NVLink</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>限制 5：负载不可预测</h3>
+      <ul class="facts">
+        <li><b>输出长度事先未知</b>：调度器不知道一个请求会占多久显存，所以要么保守预留（浪费），要么允许超卖再抢占（复杂）。</li>
+        <li><b>请求异构</b>：10 个 token 的问候和 100k token 的代码库分析混在一个批里。</li>
+        <li><b>流量突发</b>：GPU 扩容是分钟级（拉镜像、加载几百 GB 权重），流量变化是秒级。</li>
+      </ul>
+
+      <h3>限制 6：其他常被忽视的瓶颈</h3>
+      <ul class="facts">
+        <li><b>CPU 开销</b>：Python 调度、构造输入张量、kernel launch。decode 一步 GPU 只要几毫秒，CPU 慢 1 ms 就是十几个百分点的损失。这是 CUDA graph、多进程架构、调度与计算重叠的动机。</li>
+        <li><b>尾延迟</b>：一个长 prompt 进来，整个批的 ITL 都受影响。</li>
+        <li><b>数值非确定性</b>：同一请求在不同批大小下结果可能不同（浮点加法不满足结合律、kernel 按批大小选不同切分）。RL 训练和评测对此很敏感，见 <a href="#posttrain">08</a>。</li>
+        <li><b>功耗与成本</b>：大规模部署时电力和机柜才是上限，单位是“每瓦 token 数”。</li>
+      </ul>
+
+      <h3>主流加速器参数（厂商公开峰值，稠密，约值）</h3>
+      <div class="table-box"><table class="num">
+        <thead><tr><th>加速器</th><th>显存</th><th>带宽</th><th>BF16 / FP8 / FP4 稠密算力</th><th>备注</th></tr></thead>
+        <tbody>
+          <tr><td class="k">NVIDIA H100 SXM</td><td>80 GB HBM3</td><td>3.35 TB/s</td><td>989 TF / 1979 TF / —</td><td>Hopper，FP8 Transformer Engine</td></tr>
+          <tr><td class="k">NVIDIA H200</td><td>141 GB HBM3e</td><td>4.8 TB/s</td><td>同 H100</td><td>更大显存，长上下文 / 大 MoE 受益</td></tr>
+          <tr><td class="k">NVIDIA B200</td><td>约 180–192 GB HBM3e</td><td>约 8 TB/s</td><td>约 2.2 PF / 4.5 PF / 9 PF</td><td>Blackwell，原生 FP4（NVFP4）</td></tr>
+          <tr><td class="k">GB200 / GB300 NVL72</td><td>72 GPU 一个 NVLink 域</td><td>NVLink5 1.8 TB/s 双向每 GPU</td><td>—</td><td>大规模 EP 与 PD 分离的主力形态</td></tr>
+          <tr><td class="k">AMD MI300X</td><td>192 GB HBM3</td><td>5.3 TB/s</td><td>约 1.3 PF / 2.6 PF / —</td><td>ROCm；大显存适合单卡放大模型</td></tr>
+          <tr><td class="k">AMD MI355X</td><td>288 GB HBM3E</td><td>8 TB/s</td><td>支持 FP6 / FP4</td><td>CDNA4</td></tr>
+          <tr><td class="k">Google TPU v6e (Trillium)</td><td>32 GB HBM</td><td>约 1.6 TB/s</td><td>约 918 TF BF16</td><td>JAX / vLLM TPU / SGLang TPU 后端</td></tr>
+        </tbody>
+      </table></div>
+    </section>

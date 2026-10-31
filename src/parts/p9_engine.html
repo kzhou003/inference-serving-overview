@@ -1,0 +1,277 @@
+<script>
+(function () {
+  const NS = "http://www.w3.org/2000/svg";
+  let uid = 0;
+  function el(tag, attrs, parent) {
+    const e = document.createElementNS(NS, tag);
+    for (const k in attrs) if (attrs[k] !== undefined) e.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+  // Rough text width so boxes and label pills fit their text without measuring.
+  function tw(s, fs) {
+    let w = 0;
+    for (const ch of String(s)) {
+      const c = ch.codePointAt(0);
+      if (c > 0x2e80) w += fs * 1.0;
+      else if (/[A-Z0-9MW%@#]/.test(ch)) w += fs * 0.63;
+      else if (/[il.,:;|'!()\[\] ]/.test(ch)) w += fs * 0.32;
+      else w += fs * 0.55;
+    }
+    return w;
+  }
+  function text(parent, x, y, s, cls, anchor) {
+    const t = el("text", { x, y, "text-anchor": anchor || "middle", class: cls }, parent);
+    t.textContent = s;
+    return t;
+  }
+  function svgRoot(host, W, H, label, mw) {
+    const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": label || "" });
+    svg.style.minWidth = (mw || Math.min(W, 720)) + "px";
+    const body = host.querySelector(".fig-body") || host;
+    body.appendChild(svg);
+    return svg;
+  }
+  const KINDS = ["m", "acc", "warn", "pass", "todo", "vio", "teal"];
+
+  function renderFlow(host, sp) {
+    const id = "f" + uid++;
+    const W = sp.w, H = sp.h;
+    const svg = svgRoot(host, W, H, sp.label, sp.mw);
+    const defs = el("defs", {}, svg);
+    const pat = el("pattern", { id: id + "d", width: 16, height: 16, patternUnits: "userSpaceOnUse" }, defs);
+    el("circle", { cx: 2, cy: 2, r: 1, class: "f-dot" }, pat);
+    KINDS.forEach((k) => {
+      const m = el("marker", { id: id + "a" + k, viewBox: "0 0 10 10", refX: 8.5, refY: 5, markerWidth: 6.5, markerHeight: 6.5, orient: "auto-start-reverse" }, defs);
+      el("path", { d: "M0,0.5 L10,5 L0,9.5 z", class: "f-ah f-" + k }, m);
+    });
+    el("rect", { x: 0, y: 0, width: W, height: H, fill: `url(#${id}d)` }, svg);
+
+    (sp.groups || []).forEach((g) => {
+      const gg = el("g", { class: "f-grp f-" + (g.k || "m") }, svg);
+      el("rect", { x: g.x, y: g.y, width: g.w, height: g.h, rx: 12 }, gg);
+      if (g.t) text(gg, g.x + 12, g.y + 17, g.t, "", "start");
+    });
+
+    const N = {};
+    sp.nodes.forEach((n) => {
+      const subs = n.s ? String(n.s).split("\n") : [];
+      const w = n.w || Math.ceil(Math.max(84, tw(n.t, 13), ...subs.map((s) => tw(s, 11.5))) + 26);
+      const h = n.h || (subs.length ? 32 + subs.length * 15 : 36);
+      N[n.id] = Object.assign({}, n, { w, h, subs, x0: n.x - w / 2, y0: n.y - h / 2 });
+    });
+
+    function port(n, side, off) {
+      off = off || 0;
+      if (side === "r") return [n.x0 + n.w, n.y + off];
+      if (side === "l") return [n.x0, n.y + off];
+      if (side === "t") return [n.x + off, n.y0];
+      return [n.x + off, n.y0 + n.h];
+    }
+    const NORM = { r: [1, 0], l: [-1, 0], t: [0, -1], b: [0, 1] };
+    const handles = [];
+    const eg = el("g", {}, svg);
+    const lg = el("g", {}, svg);
+    (sp.edges || []).forEach((e) => {
+      const a = N[e.f], b = N[e.t];
+      if (!a || !b) { console.warn("bad edge", e); return; }
+      let fs = e.fs, ts = e.ts;
+      if (!fs || !ts) {
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const horiz = sp.dir === "h" ? true : sp.dir === "v" ? false : Math.abs(dx) - (a.w + b.w) / 2 > Math.abs(dy) - (a.h + b.h) / 2;
+        if (horiz) { fs = fs || (dx > 0 ? "r" : "l"); ts = ts || (dx > 0 ? "l" : "r"); }
+        else { fs = fs || (dy > 0 ? "b" : "t"); ts = ts || (dy > 0 ? "t" : "b"); }
+      }
+      const p1 = port(a, fs, e.fo), p2 = port(b, ts, e.to);
+      const n1 = NORM[fs], n2 = NORM[ts];
+      const k = e.c || Math.max(28, Math.hypot(p2[0] - p1[0], p2[1] - p1[1]) * 0.38);
+      let d, mid;
+      if (e.st) {
+        // orthogonal "smoothstep" path with rounded corners
+        let pts;
+        if ((fs === "r" || fs === "l") && (ts === "r" || ts === "l")) {
+          const mx = e.mx !== undefined ? e.mx : (p1[0] + p2[0]) / 2;
+          pts = [p1, [mx, p1[1]], [mx, p2[1]], p2];
+        } else if ((fs === "t" || fs === "b") && (ts === "t" || ts === "b")) {
+          const my = e.my !== undefined ? e.my : (p1[1] + p2[1]) / 2;
+          pts = [p1, [p1[0], my], [p2[0], my], p2];
+        } else if (fs === "r" || fs === "l") pts = [p1, [p2[0], p1[1]], p2];
+        else pts = [p1, [p1[0], p2[1]], p2];
+        d = "M" + pts[0].join(",");
+        for (let i = 1; i < pts.length - 1; i++) {
+          const [px, py] = pts[i - 1], [cx, cy] = pts[i], [nx, ny] = pts[i + 1];
+          const r = Math.min(9, Math.hypot(cx - px, cy - py) / 2, Math.hypot(nx - cx, ny - cy) / 2);
+          const ax = cx - Math.sign(cx - px) * r, ay = cy - Math.sign(cy - py) * r;
+          const bx = cx + Math.sign(nx - cx) * r, by = cy + Math.sign(ny - cy) * r;
+          d += ` L${ax},${ay} Q${cx},${cy} ${bx},${by}`;
+        }
+        d += " L" + pts[pts.length - 1].join(",");
+        const mi = Math.floor((pts.length - 1) / 2);
+        mid = [(pts[mi][0] + pts[mi + 1][0]) / 2, (pts[mi][1] + pts[mi + 1][1]) / 2];
+      } else if (e.line) {
+        d = `M${p1[0]},${p1[1]} L${p2[0]},${p2[1]}`;
+        mid = [(p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2];
+      } else {
+        const c1 = [p1[0] + n1[0] * k, p1[1] + n1[1] * k], c2 = [p2[0] + n2[0] * k, p2[1] + n2[1] * k];
+        d = `M${p1[0]},${p1[1]} C${c1[0]},${c1[1]} ${c2[0]},${c2[1]} ${p2[0]},${p2[1]}`;
+        mid = [(p1[0] + 3 * c1[0] + 3 * c2[0] + p2[0]) / 8, (p1[1] + 3 * c1[1] + 3 * c2[1] + p2[1]) / 8];
+      }
+      const kk = e.k || "m";
+      const cls = "f-e f-" + kk + (e.a ? " f-anim" : "") + (e.d ? " f-dash" : "");
+      const path = el("path", { d, class: cls, "data-f": e.f, "data-t": e.t }, eg);
+      if (!e.noarrow) path.setAttribute("marker-end", `url(#${id}a${kk})`);
+      if (e.both) path.setAttribute("marker-start", `url(#${id}a${kk})`);
+      handles.push(p1, p2);
+      if (e.l) {
+        const lines = String(e.l).split("\n");
+        const lw = Math.max(...lines.map((s) => tw(s, 11))) + 12, lh = lines.length * 14 + 4;
+        const mx = mid[0] + (e.lx || 0), my = mid[1] + (e.ly || 0);
+        const g = el("g", { class: "f-el", "data-f": e.f, "data-t": e.t }, lg);
+        el("rect", { x: mx - lw / 2, y: my - lh / 2, width: lw, height: lh, rx: 5 }, g);
+        lines.forEach((s, i) => text(g, mx, my - lh / 2 + 13 + i * 14, s, ""));
+      }
+    });
+    svg.appendChild(lg);
+
+    const ng = el("g", {}, svg);
+    Object.values(N).forEach((n) => {
+      let parent = ng;
+      if (n.href) { parent = el("a", { href: n.href }, ng); }
+      const g = el("g", { class: "f-node f-" + (n.k || "m") + (n.href ? " f-link" : ""), "data-id": n.id }, parent);
+      el("rect", { class: "f-box", x: n.x0, y: n.y0, width: n.w, height: n.h, rx: n.rx !== undefined ? n.rx : 9 }, g);
+      const total = 16 + n.subs.length * 15;
+      let y = n.y - total / 2 + 13;
+      text(g, n.x, y, n.t, "f-t");
+      n.subs.forEach((s, i) => text(g, n.x, y + 17 + i * 15, s, "f-s"));
+      if (n.tip) { const t = el("title", {}, g); t.textContent = n.tip; }
+    });
+    handles.forEach((p) => el("circle", { cx: p[0], cy: p[1], r: 3, class: "f-handle" }, svg));
+    (sp.notes || []).forEach((nt) => {
+      String(nt.t).split("\n").forEach((s, i) => text(svg, nt.x, nt.y + i * 15, s, "f-note f-" + (nt.k || "m"), nt.a || "middle"));
+    });
+    // hover: highlight a node's neighbourhood
+    svg.querySelectorAll(".f-node").forEach((g) => {
+      const nid = g.getAttribute("data-id");
+      g.addEventListener("mouseenter", () => {
+        svg.classList.add("f-on");
+        g.classList.add("hl");
+        svg.querySelectorAll(`[data-f="${nid}"],[data-t="${nid}"]`).forEach((p) => {
+          p.classList.add("hl");
+          const other = p.getAttribute("data-f") === nid ? p.getAttribute("data-t") : p.getAttribute("data-f");
+          const o = svg.querySelector(`.f-node[data-id="${other}"]`);
+          if (o) o.classList.add("hl");
+        });
+      });
+      g.addEventListener("mouseleave", () => {
+        svg.classList.remove("f-on");
+        svg.querySelectorAll(".hl").forEach((x) => x.classList.remove("hl"));
+      });
+    });
+  }
+
+  function renderGantt(host, sp) {
+    const rowH = sp.rowH || 28, lw = sp.labelW || 130, top = sp.top || 26, W = sp.w;
+    const rows = sp.rows;
+    const H = top + rows.length * rowH + (sp.bottom || 30);
+    const svg = svgRoot(host, W, H, sp.label, sp.mw);
+    const sc = (W - lw - 16) / sp.max;
+    const X = (v) => lw + v * sc;
+    if (sp.ticks) {
+      for (let v = 0; v <= sp.max + 1e-9; v += sp.ticks) {
+        el("line", { x1: X(v), x2: X(v), y1: top - 6, y2: top + rows.length * rowH, class: "g-grid" }, svg);
+        if (sp.tickLabels !== false) text(svg, X(v), top + rows.length * rowH + 14, (sp.tickFmt ? sp.tickFmt(v) : v), "g-ax");
+      }
+    }
+    rows.forEach((r, i) => text(svg, lw - 10, top + i * rowH + rowH / 2 + 4, r, "g-lab", "end"));
+    (sp.bars || []).forEach((b) => {
+      const y = top + b.r * rowH + 4, h = rowH - 8;
+      const x = X(b.s), w = Math.max(1.5, X(b.e) - X(b.s));
+      const k = b.k || "acc";
+      el("rect", { x, y, width: w, height: h, rx: 3, class: "g-bar k-" + k }, svg);
+      if (b.t && tw(b.t, 10.5) < w - 4) text(svg, x + w / 2, y + h / 2 + 3.5, b.t, "g-bt" + (/s$|^m$/.test(k) ? " dk" : ""));
+    });
+    (sp.marks || []).forEach((m) => {
+      const k = m.k || "todo";
+      if (m.e !== undefined) {
+        // span bracket above/below a row
+        const y = top + m.r * rowH + (m.below ? rowH + 2 : -2);
+        el("line", { x1: X(m.s), x2: X(m.e), y1: y, y2: y, class: "g-mark k-" + k, "stroke-dasharray": "0" }, svg);
+        el("line", { x1: X(m.s), x2: X(m.s), y1: y - 4, y2: y + 4, class: "g-mark k-" + k, "stroke-dasharray": "0" }, svg);
+        el("line", { x1: X(m.e), x2: X(m.e), y1: y - 4, y2: y + 4, class: "g-mark k-" + k, "stroke-dasharray": "0" }, svg);
+        text(svg, (X(m.s) + X(m.e)) / 2, y + (m.below ? 13 : -5), m.t, "g-mt k-" + k);
+      } else {
+        el("line", { x1: X(m.x), x2: X(m.x), y1: top - 8, y2: top + rows.length * rowH + 2, class: "g-mark k-" + k }, svg);
+        text(svg, X(m.x) + (m.dx || 0), top - 12, m.t, "g-mt k-" + k, m.a || "middle");
+      }
+    });
+    if (sp.axis) text(svg, W - 16, H - 6, sp.axis, "g-ax", "end");
+  }
+
+  function renderChart(host, sp) {
+    const W = sp.w, H = sp.h, L = sp.left || 64, R = sp.right || 20, T = sp.top || 20, B = sp.bottom || 46;
+    const svg = svgRoot(host, W, H, sp.label, sp.mw);
+    const f = (v, lg) => (lg ? Math.log10(v) : v);
+    const [x0, x1] = sp.xr.map((v) => f(v, sp.xlog)), [y0, y1] = sp.yr.map((v) => f(v, sp.ylog));
+    const X = (v) => L + ((f(v, sp.xlog) - x0) / (x1 - x0)) * (W - L - R);
+    const Y = (v) => H - B - ((f(v, sp.ylog) - y0) / (y1 - y0)) * (H - T - B);
+    (sp.xticks || []).forEach((v) => { el("line", { x1: X(v), x2: X(v), y1: T, y2: H - B, class: "g-grid" }, svg); text(svg, X(v), H - B + 16, sp.xfmt ? sp.xfmt(v) : v, "g-ax"); });
+    (sp.yticks || []).forEach((v) => { el("line", { x1: L, x2: W - R, y1: Y(v), y2: Y(v), class: "g-grid" }, svg); text(svg, L - 8, Y(v) + 4, sp.yfmt ? sp.yfmt(v) : v, "g-ax", "end"); });
+    if (sp.xlabel) text(svg, (L + W - R) / 2, H - 8, sp.xlabel, "g-ax");
+    if (sp.ylabel) { const t = text(svg, 14, (T + H - B) / 2, sp.ylabel, "g-ax"); t.setAttribute("transform", `rotate(-90 14 ${(T + H - B) / 2})`); }
+    (sp.areas || []).forEach((a) => {
+      const d = a.pts.map((p, i) => (i ? "L" : "M") + X(p[0]) + "," + Y(p[1])).join(" ") + " Z";
+      el("path", { d, class: "c-area" }, svg);
+    });
+    (sp.series || []).forEach((s) => {
+      const d = s.pts.map((p, i) => (i ? "L" : "M") + X(p[0]).toFixed(1) + "," + Y(p[1]).toFixed(1)).join(" ");
+      el("path", { d, class: "c-line k-" + (s.k || "acc") }, svg);
+      if (s.t) text(svg, X(s.tx) + (s.dx || 0), Y(s.ty) + (s.dy || 0), s.t, "g-mt k-" + (s.k || "acc"), s.a || "start");
+    });
+    (sp.points || []).forEach((p) => {
+      el("circle", { cx: X(p.x), cy: Y(p.y), r: p.r || 5.5, class: "c-pt k-" + (p.k || "acc") }, svg);
+      if (p.t) String(p.t).split("\n").forEach((s, i) => text(svg, X(p.x) + (p.dx || 9), Y(p.y) + (p.dy || 4) + i * 13, s, "g-mt k-" + (p.k || "acc"), p.a || "start"));
+    });
+    (sp.notes || []).forEach((n) => String(n.t).split("\n").forEach((s, i) => text(svg, X(n.x), Y(n.y) + i * 13, s, "g-mt k-" + (n.k || "m"), n.a || "start")));
+  }
+
+  function run() {
+    __FIG.forEach(([kind, id, spec]) => {
+      const host = document.getElementById(id);
+      if (!host) { console.warn("missing figure", id); return; }
+      try {
+        if (kind === "flow") renderFlow(host, spec);
+        else if (kind === "gantt") renderGantt(host, spec);
+        else renderChart(host, spec);
+      } catch (err) { console.error(id, err); }
+    });
+    // theme toggle (per-viewer convenience)
+    const btn = document.getElementById("themeBtn");
+    const root = document.documentElement;
+    try { const s = localStorage.getItem("isg-theme"); if (s) root.setAttribute("data-theme", s); } catch (e) {}
+    if (btn) btn.addEventListener("click", () => {
+      const dark = root.getAttribute("data-theme") ? root.getAttribute("data-theme") === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+      const next = dark ? "light" : "dark";
+      root.setAttribute("data-theme", next);
+      try { localStorage.setItem("isg-theme", next); } catch (e) {}
+    });
+    // highlight current section in the index
+    const links = [...document.querySelectorAll("nav.toc > ol > li > a")];
+    const map = new Map(links.map((a) => [a.getAttribute("href").slice(1), a]));
+    if ("IntersectionObserver" in window) {
+      const io = new IntersectionObserver((ents) => {
+        ents.forEach((en) => {
+          if (en.isIntersecting && map.has(en.target.id)) {
+            links.forEach((a) => a.classList.remove("cur"));
+            map.get(en.target.id).classList.add("cur");
+          }
+        });
+      }, { rootMargin: "-20% 0px -70% 0px" });
+      document.querySelectorAll("main > section").forEach((s) => io.observe(s));
+    }
+  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", run);
+  else run();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,112 @@
+
+    <section id="coding">
+      <h2><span class="no">12</span>Coding Agent 的推理：长会话、高命中、慢工具</h2>
+      <p>代码是目前 LLM 商业化最成功的场景之一，但“写代码”背后其实是三种完全不同的推理负载：编辑器内的<b>行内补全</b>、把建议应用到文件的<b>快速编辑（apply）</b>，以及自主完成任务的 <b>agentic coding</b>（Claude Code、Codex、Cursor Agent、OpenHands 等）。它们对 serving 的要求差别之大，几乎可以当成三个产品来设计。</p>
+
+      <h3>模型特征 → 场景 → 推理负载</h3>
+      <div class="table-box"><table class="chain">
+        <thead><tr><th>模型特征</th><th>为什么这样设计（场景决定）</th><th>在推理负载上的体现</th></tr></thead>
+        <tbody>
+          <tr><td>超长上下文（128k–1M token）</td><td>要读懂整个仓库、长日志、长 diff；agent 任务一次跑几十上百轮</td><td>单请求 prompt 常在 50k–200k；KV 显存巨大（70B 级模型 100k 上下文单请求 30 GB 量级）；prefill 是主要算力消耗</td></tr>
+          <tr><td>工具调用 + 在 SWE 类环境上做 agentic RL</td><td>模型要自己读文件、改代码、跑测试、看报错再修</td><td><b>多轮、追加式上下文</b>：每轮只在末尾追加工具输出，前面全部不变 → 前缀命中率可达 90% 以上，成为最关键的指标；两轮之间有工具执行的“空档”（秒到分钟）</td></tr>
+          <tr><td>推理（thinking）模式，交错思考与工具调用</td><td>规划、定位 bug、复杂重构需要先想再做</td><td>输出也长；agent 循环是串行的，每用户 tokens/s 直接决定任务完成时间，所以 TPOT 比聊天更重要</td></tr>
+          <tr><td>FIM（fill-in-the-middle）训练的小模型</td><td>编辑器补全需要看到光标前后的代码</td><td>补全：输出很短、端到端预算几百毫秒、QPS 极高、大量请求在完成前就被取消（用户继续打字）</td></tr>
+          <tr><td>代码高度可预测，编辑大量复制原文</td><td>改代码时大部分内容保持不变</td><td>投机解码收益特别大：prompt lookup / n-gram 直接从原文件取 draft（“speculative edits”），apply 模型可以跑到每秒上千 token</td></tr>
+          <tr><td>大 MoE 骨干（Qwen3-Coder、Kimi K2、GLM、DeepSeek、MiniMax 系列等）</td><td>强能力 + 可控推理成本</td><td>继承 <a href="#moe">05</a> 的所有 MoE 部署问题；长上下文让 KV 而不是权重成为显存主体</td></tr>
+        </tbody>
+      </table></div>
+
+      <figure class="figure" id="fig-coding"><div class="fig-body"></div>
+        <figcaption><b>一次 agentic coding 会话的推理时间线。</b>每一轮都是“很长的前缀（几乎全命中）+ 新的工具输出（需要 prefill）+ 一段生成”，轮与轮之间 GPU 在等工具执行。如果这段空档里 KV 被淘汰，下一轮就要重算整个前缀；所以 KV 要么留在 GPU、要么下沉到 CPU / SSD 并能快速取回，路由还必须把同一会话送回同一实例（或能取到同一份 KV）。</figcaption>
+      </figure>
+      <script>
+      gantt("fig-coding", { w: 920, max: 48, labelW: 130, rowH: 26, top: 24, rows: ["GPU（本会话）", "Sandbox", "KV 去向"], ticks: 4, tickLabels: false, axis: "时间 →（一轮 = prefill 增量 + 生成 + 工具执行）", bars: [
+        { r: 0, s: 0, e: 4, t: "首轮 prefill", k: "acc" }, { r: 0, s: 4, e: 9, t: "生成", k: "pass" }, { r: 1, s: 9, e: 17, t: "跑测试", k: "teal" },
+        { r: 0, s: 17, e: 18.5, t: "增量", k: "acc" }, { r: 0, s: 18.5, e: 23, t: "生成", k: "pass" }, { r: 1, s: 23, e: 33, t: "编译 + 测试", k: "teal" },
+        { r: 0, s: 33, e: 34.5, t: "增量", k: "acc" }, { r: 0, s: 34.5, e: 39, t: "生成", k: "pass" }, { r: 1, s: 39, e: 46, t: "grep / 读文件", k: "teal" },
+        { r: 2, s: 0, e: 9, t: "GPU", k: "accs" }, { r: 2, s: 9, e: 17, t: "保留或下沉 CPU", k: "warns" }, { r: 2, s: 17, e: 23, t: "GPU", k: "accs" }, { r: 2, s: 23, e: 33, t: "保留或下沉 CPU", k: "warns" }, { r: 2, s: 33, e: 39, t: "GPU", k: "accs" }, { r: 2, s: 39, e: 46, t: "…", k: "warns" }
+      ]});
+      </script>
+
+      <h3>三种负载的对比</h3>
+      <div class="table-box"><table>
+        <thead><tr><th>维度</th><th>行内补全（Tab）</th><th>快速编辑 / apply</th><th>Agentic coding</th></tr></thead>
+        <tbody>
+          <tr><td class="k">模型</td><td>小模型（几 B），FIM</td><td>中小模型，专门训练“改写文件”</td><td>前沿大模型（常为 MoE），thinking + tool use</td></tr>
+          <tr><td class="k">输入 / 输出</td><td>几千 token / 几十 token</td><td>整个文件 + 修改意图 / 几乎整个文件</td><td>5 万–20 万 token（逐轮增长）/ 几百到几千 token 每轮</td></tr>
+          <tr><td class="k">延迟目标</td><td>端到端几百毫秒以内</td><td>整文件改写一两秒</td><td>每轮 TTFT 与 TPOT；整体任务完成时间（分钟级）</td></tr>
+          <tr><td class="k">关键技术</td><td>小模型 + 低延迟部署、请求取消、边缘 / 近端部署、前缀 cache（同文件反复请求）</td><td>投机解码（原文件作 draft）、高 tokens/s</td><td>前缀 cache 与 KV 分层存储、会话粘性 / KV 感知路由、长上下文 kernel、tool-call 解析、sandbox 编排、上下文压缩（compaction）</td></tr>
+          <tr><td class="k">计费与成本</td><td>按席位</td><td>按 token</td><td>缓存命中的输入远便宜于未命中；命中率直接决定毛利</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>Serving 侧的具体做法</h3>
+      <ul class="facts">
+        <li><b>把命中率当一等指标。</b>监控 per-session 的 cached-token 比例；路由用会话 ID 或前缀哈希做粘性，再叠加负载感知（<a href="#scale">06</a> 的 KV 感知路由）。商业 API 的 prompt caching（例如 Anthropic 默认 5 分钟、可选 1 小时 TTL 的缓存）就是把“工具空档里保留 KV”这件事产品化。</li>
+        <li><b>KV 的生命周期跨越工具调用。</b>GPU 上用 LRU 保留，压力大时下沉到 CPU / SSD（LMCache、HiCache、Mooncake、Dynamo KVBM）；按 <a href="#kv">4.2</a> 的估算，载回远比重算便宜。</li>
+        <li><b>长上下文 prefill 的成本控制：</b>chunked prefill 防止一个 200k prompt 卡住别人；必要时用上下文并行；agent 侧做上下文压缩、子 agent 拆分任务，减少单会话上下文长度。</li>
+        <li><b>可靠的工具调用：</b>每个模型家族的 tool-call 格式不同，引擎里的 tool parser / reasoning parser 必须和模型模板严格匹配；必要时用结构化输出约束参数 JSON。</li>
+        <li><b>Sandbox 是推理链路的一部分：</b>每个会话一个隔离环境（容器 / microVM），要快速创建、可暂停恢复、可快照；训练（agentic RL）和线上用的是同一套。阿里开源的 OpenSandbox 就是面向 coding agent、GUI agent、评测和 RL 的通用 sandbox 平台（Docker / Kubernetes 运行时，多语言 SDK，内置 MCP server），见 <a href="#adjacent">14</a>。</li>
+        <li><b>评测：</b>SWE-bench 系列（真实仓库 issue → 补丁 → 在容器里跑测试）、Terminal-Bench 等；评测本身就是“推理 + 大量 sandbox”的负载。</li>
+      </ul>
+      <div class="srcs"><span class="srcs-label">源码</span>{{s:vllm-project/vllm:vllm/tool_parsers|vLLM tool_parsers/}}{{s:vllm-project/vllm:vllm/reasoning|vLLM reasoning/}}{{s:sgl-project/sglang:python/sglang/srt/function_call|SGLang function_call/}}{{s:sgl-project/sglang:python/sglang/srt/parser/reasoning_parser.py|SGLang reasoning_parser.py}}{{s:vllm-project/vllm:vllm/v1/spec_decode/ngram_proposer.py|n-gram draft（编辑场景）}}{{r:LMCache/LMCache|LMCache}}</div>
+      <div class="srcs"><span class="srcs-label">Agent / Sandbox</span>{{r:opensandbox-group/OpenSandbox|OpenSandbox（阿里开源）}}{{s:opensandbox-group/OpenSandbox:components/execd|OpenSandbox execd}}{{s:opensandbox-group/OpenSandbox:server|OpenSandbox server}}{{s:opensandbox-group/OpenSandbox:sdks|SDKs}}{{s:opensandbox-group/OpenSandbox:kubernetes|K8s 运行时}}{{s:SWE-agent/SWE-ReX:src/swerex/deployment|SWE-ReX deployment}}{{s:SWE-bench/SWE-bench:swebench/harness|SWE-bench harness}}{{r:All-Hands-AI/OpenHands|OpenHands}}{{w:opensandbox-group/OpenSandbox|OpenSandbox · Code Wiki}}</div>
+    </section>
+
+    <section id="science">
+      <h2><span class="no">13</span>AI for Science 的推理：结构、几何与物理</h2>
+      <p>科学模型的输入不是自然语言，而是蛋白质序列与多序列比对、原子坐标、基因组、全球气象网格。这些数据的结构决定了模型结构（成对表示、等变网络、图网络、超长卷积），进而让推理负载和 LLM serving 很不一样：<b>batch 往往为 1、显存随问题规模平方增长、CPU 侧预处理可能比 GPU 推理还慢、对数值精度更敏感、大量是离线批量筛选</b>。</p>
+
+      <h3>模型特征 → 场景 → 推理负载</h3>
+      <div class="table-box"><table class="chain">
+        <thead><tr><th>模型特征</th><th>为什么这样设计（科学问题决定）</th><th>在推理负载上的体现</th></tr></thead>
+        <tbody>
+          <tr><td><b>蛋白 / 复合物结构预测</b>（AlphaFold2/3、OpenFold、Boltz、Chai-1、Protenix）：维护 N×N×c 的<b>成对表示</b>，用三角乘法 / 三角注意力更新</td><td>结构本质是残基两两之间的几何关系，三角更新近似强制“三角不等式”一致性</td><td>显存随残基数 <b>平方</b>增长，三角注意力计算接近 <b>立方</b>；几千残基的复合物就会爆显存 → 分块（chunking）、低精度、专用三角注意力 kernel；每个复合物单独推理，batch≈1，形状各不相同（难以 CUDA graph）</td></tr>
+          <tr><td>以 <b>MSA（多序列比对）</b>和模板为输入</td><td>同源序列的共进化信号揭示哪些残基在空间上接触</td><td>推理前要在 TB 级序列库上做 jackhmmer / HHblits 搜索，CPU 小时级，常常比 GPU 推理慢得多 → MMseqs2（ColabFold）加速、MSA 缓存与共享服务、GPU 加速搜索</td></tr>
+          <tr><td>AF3 类模型的<b>扩散结构模块</b> + 多 seed 采样与置信度排序</td><td>全原子（蛋白、核酸、小分子、离子）生成，需要多样本评估置信度</td><td>一次预测 = 主干一次 + 扩散几百步 × 多个样本 → 吞吐与延迟都看扩散部分；可以像 <a href="#diffusion">10</a> 一样批量化多个样本</td></tr>
+          <tr><td><b>蛋白 / DNA 语言模型</b>（ESM-2/ESM3、Evo 2）：Transformer 或卷积–注意力混合（Evo 2 的 StripedHyena 2），上下文最长到百万碱基</td><td>基因组有长程调控关系；进化数据量巨大，适合自监督</td><td>最像 LLM 的科学负载：主要是<b>批量 embedding / 打分</b>（整个蛋白组、变异效应评分）而不是交互生成 → 吞吐优先、离线；长序列需要长卷积 / 上下文并行 kernel</td></tr>
+          <tr><td><b>天气 / 气候模型</b>（GraphCast：网格上的 GNN；FourCastNet：频域算子；GenCast：扩散集合预报）</td><td>全球格点、物理场之间的相互作用；预报本身是概率性的</td><td>自回归滚动几十步（例如 6 小时一步滚 10 天）；集合预报要几十个成员 → 天然的批；输入输出是 TB 级再分析数据，<b>I/O 与数据管线</b>常是瓶颈；需要在 HPC 定时批量运行</td></tr>
+          <tr><td><b>机器学习原子势（MLIP）</b>（MACE、NequIP / Allegro、Meta 的 UMA）：E(3) 等变图网络，球谐与张量积</td><td>物理量在旋转 / 平移下必须正确变换（能量不变，力等变），保证分子动力学稳定</td><td>嵌在分子动力学循环里跑<b>百万步</b>，每步一个小图（几百到几千原子）→ 延迟与 kernel launch 主导；等变张量积 kernel 是热点（cuEquivariance）；常要求 FP32 甚至 FP64 精度，BF16 可能破坏能量守恒</td></tr>
+          <tr><td>科研 agent（文献、实验规划、调用仿真工具）</td><td>把 LLM 当作科研助理</td><td>本质上和 <a href="#coding">12</a> 的 coding agent 一样：长上下文、多轮工具调用、sandbox 执行代码</td></tr>
+        </tbody>
+      </table></div>
+
+      <figure class="figure" id="fig-af"><div class="fig-body"></div>
+        <figcaption><b>AlphaFold3 类结构预测的推理流水线。</b>CPU 侧的序列库搜索常常占端到端时间的大头；GPU 侧主干（Pairformer）的显存随 N² 增长，扩散模块要为每个 seed 跑多步去噪。服务化时通常把 MSA 搜索、主干推理、扩散采样拆成独立的、可分别扩缩的阶段。</figcaption>
+      </figure>
+      <script>
+      flow("fig-af", { w: 980, h: 300, label: "结构预测推理流水线", nodes: [
+        { id: "seq", x: 80, y: 80, t: "输入", s: "蛋白 / 核酸序列\n配体 SMILES", w: 140 },
+        { id: "msa", x: 270, y: 80, t: "MSA / 模板搜索", s: "jackhmmer · MMseqs2\nTB 级数据库 · CPU 密集", k: "warn", w: 190 },
+        { id: "cache", x: 270, y: 220, t: "MSA 缓存", s: "同一蛋白复用", k: "warn", w: 150 },
+        { id: "trunk", x: 500, y: 80, t: "主干 Pairformer", s: "N×N 成对表示 · 三角更新\n显存 ∝ N²，需分块", k: "acc", w: 210 },
+        { id: "diff", x: 740, y: 80, t: "扩散结构模块", s: "每个 seed 多步去噪", k: "vio", w: 170 },
+        { id: "conf", x: 740, y: 220, t: "置信度头", s: "pLDDT · PAE · 排序", k: "pass", w: 160 },
+        { id: "out", x: 910, y: 150, t: "结构", s: "mmCIF", w: 100 }
+      ], edges: [
+        { f: "seq", t: "msa", k: "warn" }, { f: "msa", t: "cache", k: "warn", both: true }, { f: "msa", t: "trunk", k: "acc", l: "特征" }, { f: "trunk", t: "diff", k: "vio", l: "条件" },
+        { f: "diff", t: "conf", k: "pass" }, { f: "conf", t: "out", k: "pass" }
+      ]});
+      </script>
+
+      <h3>与 LLM serving 的差异总结</h3>
+      <div class="table-box"><table>
+        <thead><tr><th>维度</th><th>LLM serving</th><th>AI for Science 推理</th></tr></thead>
+        <tbody>
+          <tr><td class="k">批处理</td><td>continuous batching，几百并发</td><td>常为 batch=1（结构预测、MD）；或天然大批（集合预报、蛋白组 embedding、虚拟筛选）</td></tr>
+          <tr><td class="k">形状</td><td>变长但每 token 计算相同</td><td>问题规模差别巨大（几十到几千残基），显存按 N² 增长，常需按大小分桶 / 分配不同显存的卡</td></tr>
+          <tr><td class="k">瓶颈</td><td>decode 带宽</td><td>成对表示的显存、三角运算、CPU 预处理（MSA）、数据 I/O、小图上的 launch 开销</td></tr>
+          <tr><td class="k">精度</td><td>FP8 / FP4 已普遍</td><td>BF16 / TF32 为主，MLIP 等可能需要 FP32 / FP64；可重复性要求高</td></tr>
+          <tr><td class="k">部署形态</td><td>在线 API</td><td>HPC 批作业（Slurm）、科研平台的异步任务、少量在线服务（如 AlphaFold Server、NVIDIA BioNeMo NIM）</td></tr>
+          <tr><td class="k">专用 kernel</td><td>attention、GEMM、MoE</td><td>三角注意力 / 三角乘法、带 pair bias 的 attention、等变张量积、球谐、图的 scatter / gather、FFT</td></tr>
+        </tbody>
+      </table></div>
+      <ul class="facts">
+        <li><b>优化手段：</b>主干分块与 activation offload；三角注意力 kernel（NVIDIA cuEquivariance 提供 triangle attention / multiplication，DeepSpeed4Science 有 Evoformer attention）；MSA 搜索 GPU 化与缓存；扩散样本批量化；MLIP 用 CUDA graph 和融合的等变 kernel 降低每步延迟，并与 LAMMPS / ASE 等 MD 引擎原生集成。</li>
+        <li><b>服务化：</b>NVIDIA BioNeMo（框架与 NIM 微服务，覆盖结构预测、蛋白 / 基因组语言模型）、Google DeepMind 的 AlphaFold Server、ColabFold 的公共 MSA 服务、NVIDIA Earth2Studio（天气模型推理与集合预报流水线）、ECMWF 的 AI 预报业务化运行。</li>
+      </ul>
+      <div class="srcs"><span class="srcs-label">结构预测</span>{{s:google-deepmind/alphafold3:src/alphafold3/model/network/evoformer.py|AF3 evoformer.py}}{{s:google-deepmind/alphafold3:src/alphafold3/model/network/diffusion_head.py|AF3 diffusion_head.py}}{{s:google-deepmind/alphafold3:src/alphafold3/data/pipeline.py|AF3 数据流水线（MSA）}}{{s:aqlaboratory/openfold:openfold/model/evoformer.py|OpenFold evoformer.py}}{{s:jwohlwend/boltz:src/boltz/model/layers/pairformer.py|Boltz pairformer.py}}{{s:jwohlwend/boltz:src/boltz/model/layers/triangular_attention|Boltz 三角注意力}}{{r:chaidiscovery/chai-lab|Chai-1}}{{s:bytedance/Protenix:protenix/model|Protenix model/}}{{s:sokrypton/ColabFold:colabfold/batch.py|ColabFold batch.py}}</div>
+      <div class="srcs"><span class="srcs-label">序列模型</span>{{s:facebookresearch/esm:esm/modules.py|ESM-2 modules.py}}{{r:evolutionaryscale/esm|ESM3}}{{s:ArcInstitute/evo2:evo2/models.py|Evo 2 models.py}}{{s:NVIDIA/bionemo-framework:models|BioNeMo recipes models/}}</div>
+      <div class="srcs"><span class="srcs-label">天气 / 原子</span>{{s:google-deepmind/graphcast:weathernext/weathernext1_graph/graphcast.py|GraphCast（weathernext）}}{{s:NVIDIA/earth2studio:earth2studio/models/px|Earth2Studio 预报模型}}{{s:ACEsuit/mace:mace/modules/blocks.py|MACE blocks.py}}{{s:ACEsuit/mace:mace/calculators/lammps_mliap_mace.py|MACE × LAMMPS}}{{s:FAIR-Chem/fairchem:src/fairchem/core/models/uma|UMA (fairchem)}}{{s:NVIDIA/cuEquivariance:cuequivariance_torch/cuequivariance_torch/primitives/triangle.py|cuEquivariance triangle}}{{s:NVIDIA/cuEquivariance:cuequivariance/cuequivariance/segmented_polynomials/segmented_tensor_product.py|等变张量积}}{{r:e3nn/e3nn|e3nn}}</div>
+      <div class="srcs"><span class="srcs-label">Code Wiki</span>{{w:google-deepmind/alphafold3|AlphaFold3}}{{w:jwohlwend/boltz|Boltz}}{{w:ACEsuit/mace|MACE}}{{w:NVIDIA/earth2studio|Earth2Studio}}</div>
+    </section>

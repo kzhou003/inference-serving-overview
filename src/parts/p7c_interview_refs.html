@@ -1,0 +1,144 @@
+    <section id="interview">
+      <h2><span class="no">17</span>面试速查</h2>
+      <h3>估算公式（背下来，现场能算）</h3>
+      <div class="formula">权重显存      = N_params × bytes（BF16=2, FP8=1, FP4=0.5）           70B BF16 ≈ 140 GB
+KV / token    = 2 × L × n_kv × d_head × bytes                        Llama-3-70B ≈ 320 KiB
+最大 KV token  ≈ (显存 × util − 权重 − 激活/图) / KV per token
+decode 下限    ≈ (权重字节 + 本批 KV 字节) / HBM 带宽                   8B@H100 ≈ 4.8 ms/step
+prefill 时间   ≈ 2 × N_params × prompt_tokens / (峰值 × MFU)          8B, 2k tok, MFU 60% ≈ 54 ms
+并发           = 到达率 × 平均停留时间（Little）
+投机期望 token  = (1 − α^(k+1)) / (1 − α)
+TP all-reduce  每层 2 次，每次 ≈ tokens × hidden × bytes
+成本 / 1M tok  = GPU 时价 / (tok/s/GPU × 3600 / 1e6)                  $2.5/h, 2500 tok/s → ≈ $0.28</div>
+      <div class="callout pass"><b class="h">例题：Llama-3-70B（BF16）放在 8×H100 上，TP=8，能装多少 KV？</b>
+        <p>权重 140 GB ÷ 8 = 17.5 GB/卡；按 0.9 利用率可用 72 GB，扣掉权重和约 4 GB 激活 / CUDA graph，每卡约 50 GB 给 KV，8 卡共约 400 GB。GQA 有 8 个 KV head，TP=8 时每卡正好 1 个 head，每 token 的 320 KiB 均摊到 8 卡。总容量 ≈ 400 GB ÷ 320 KiB ≈ 120 万 token，即约 300 个 4k 上下文的并发请求。</p>
+      </div>
+
+      <h3>高频问题</h3>
+      <details class="qa"><summary>为什么 decode 是 memory-bound？怎么提高它的硬件利用率？</summary>
+        <p>每个 decode step 每个请求只处理 1 个 token，却要把全部权重从 HBM 读一遍，算术强度约等于批大小 B，远低于 H100 约 295 FLOP/byte 的脊点；attention 读 KV 的强度约为 1，且不能被批摊薄。</p>
+        <ul><li>加大批：continuous batching + PagedAttention 腾出 KV 空间 + 量化 / MLA 缩小 KV。</li><li>减少字节：权重 FP8 / FP4、KV FP8。</li><li>一次算多个 token：投机解码、MTP。</li><li>减少 CPU 空泡：CUDA graph、重叠调度。</li></ul>
+      </details>
+      <details class="qa"><summary>解释 PagedAttention，它的代价是什么？</summary>
+        <p>KV 按固定大小 block 分页，block table 把逻辑块映射到物理块，按需分配，消除预留浪费和外部碎片，并支持引用计数共享与 copy-on-write。代价：attention kernel 需要间接寻址（早期比连续布局慢一些，现在 FlashInfer / FA 已基本抹平）；block 太大有内部碎片，太小则元数据和寻址开销上升；所有 kernel（attention、KV 写入、拷贝）都要支持分页布局。</p>
+      </details>
+      <details class="qa"><summary>vLLM 的 prefix caching 和 SGLang 的 RadixAttention 有什么不同？</summary>
+        <p>vLLM 用“父哈希 + 本块 token”的链式哈希给每个满 block 编号，查表 O(1)，只能以 block 为粒度命中；SGLang 用 radix tree 存 token 序列，可以 token 粒度匹配，天然表达树状共享，并配合 cache-aware 调度和 LRU 叶子淘汰。两者效果在常见负载上接近，radix tree 在复杂分支（多轮、树搜索、多采样）上更直观。</p>
+      </details>
+      <details class="qa"><summary>Chunked prefill 和 PD 分离，什么时候用哪个？</summary>
+        <p>两者都解决 prefill 干扰 decode。chunked prefill 在同一 GPU 内按时间切分，零额外基础设施，中小规模首选；代价是 prefill 效率略降、两阶段仍共享并行配置。PD 分离在空间上隔离，适合大规模、长 prompt、TTFT 和 TPOT SLO 都严格、或两阶段需要不同并行度（如 DeepSeek 的 EP32 vs EP144）的场景；代价是 KV 传输（需要 RDMA）和系统复杂度。</p>
+      </details>
+      <details class="qa"><summary>投机解码为什么能保证输出分布不变？什么时候不该用？</summary>
+        <p>验证时对每个 draft token 以 min(1, p_target/p_draft) 的概率接受，拒绝时从 (p_target − p_draft)₊ 归一化后的分布重新采样，可以证明最终每个位置的分布与目标模型直接采样完全相同（贪心时就是逐 token 比对）。高并发（GPU 已 compute-bound）、接受率低（高温、开放创作）、draft 成本高时收益为负。</p>
+      </details>
+      <details class="qa"><summary>MoE 推理的主要挑战？为什么 DeepSeek 用 DP attention + 大 EP？</summary>
+        <ul><li>显存按总参数算，计算按激活参数算；decode 时每个专家分到的 token 很少，GEMM 小而 memory-bound。</li><li>EP 带来每层两次 all-to-all，且负载不均。</li><li>宽 EP 让每卡只放少数专家，显存留给 KV，全局 token 汇聚后每专家批变大；MLA 不适合 TP，所以 attention 用 DP。配套 DeepEP、TBO 重叠、EPLB 冗余专家、DeepGEMM grouped GEMM。</li></ul>
+      </details>
+      <details class="qa"><summary>TP、PP、EP 怎么选？</summary>
+        <p>先看能否放下：单卡放得下就用 DP 多副本。放不下时机内优先 TP（降延迟，需要 NVLink）；跨机时 TP 通信太贵，用 PP（不降单 token 延迟）或对 MoE 用 EP。TP 太大时每卡 GEMM 变瘦、通信占比上升，收益递减。长 prompt prefill 可加 CP。MoE 的常见组合是 attention DP（或小 TP）+ 专家 EP。</p>
+      </details>
+      <details class="qa"><summary>线上 TTFT p99 突然变差，怎么排查？</summary>
+        <ul><li>拆解 TTFT：排队时间 vs prefill 时间（看引擎的 queue time 指标）。</li><li>排队变长：流量上涨、扩容滞后、某实例被路由打爆（看各实例负载是否均衡）、抢占重算增多（KV 不足）。</li><li>prefill 变长：长 prompt 比例上升、前缀命中率下降（路由策略或会话粘性变化、cache 被挤出）、chunk 设置变化。</li><li>CPU 侧：tokenizer / 多模态预处理成为瓶颈、API server 进程不够。</li><li>最后看硬件：降频、NVLink / 网卡异常、某张卡 ECC 错误。</li></ul>
+      </details>
+      <details class="qa"><summary>设计一个支持大量用户的聊天服务（system design 骨架）</summary>
+        <ul><li>需求：模型规模、QPS、ISL/OSL 分布、TTFT / TPOT SLO、成本目标。</li><li>容量估算：用 Little 定律算并发 → 算 KV 需求 → 每实例并发上限 → 实例数；用基准曲线选满足 SLO 的批大小和每 GPU 吞吐。</li><li>单实例：引擎选型、并行方式、量化、chunked prefill、前缀 cache、投机。</li><li>集群：API 网关（鉴权、限流）→ KV 感知路由 → （可选 PD 分离）→ 分层 KV 池；按队列 / SLO 指标自动扩缩；多区域。</li><li>可靠性：健康检查、重试、优雅下线、降级（换小模型、限制 max_tokens）。</li><li>观测：TTFT / ITL 分位数、命中率、KV 使用率、错误率、成本看板。</li></ul>
+      </details>
+      <details class="qa"><summary>量化模型上线前怎么验证？</summary>
+        <p>先确认 kernel 路径（是否真的走了 FP8 / FP4 Tensor Core，还是退回反量化）；精度上在目标任务上做回归（数学、代码、长上下文检索、多语言），不要只看 perplexity；用相同采样参数对比输出分布；压测确认吞吐和延迟收益；灰度上线并监控用户侧指标。</p>
+      </details>
+      <details class="qa"><summary>RL rollout 和在线 serving 有什么不同？</summary>
+        <p>目标是 step 时间而不是单请求 SLO；权重每步更新（共置用 CUDA IPC + sleep mode，分离用 NCCL / RDMA 广播）；长尾严重（partial rollout、异步 RL、动态采样）；要求推理 logprob 与训练一致（重算 + 重要性采样修正、MoE 路由回放、确定性 kernel）；agentic 任务需要大量 sandbox 和多轮 KV 复用。</p>
+      </details>
+      <details class="qa"><summary>Omni / 语音模型的 serving 和 LLM 有什么不同？</summary>
+        <p>一个模型是多个异构阶段（encoder、Thinker、Talker、codec 解码器），各需不同的批处理和资源；阶段间要传张量；输出是实时流，核心指标变成首包延迟和 RTF，要 chunk 级异步交接；全双工需要持久会话和按节拍推进的调度；多模态预处理和 encoder 可以缓存或单独拆分（EPD）。</p>
+      </details>
+      <details class="qa"><summary>扩散模型推理怎么加速？</summary>
+        <p>它是 compute-bound 的固定步数迭代：减步数（蒸馏）收益最大；免训练的特征缓存（TeaCache、FBCache 等）复用相邻步特征；视频长序列用序列并行（Ulysses / Ring / USP）和稀疏 attention；CFG 并行；FP8 / 4-bit 量化；torch.compile / TensorRT；VAE 分块与并行。serving 上用异步任务 API、步级批处理、LoRA 热切换。</p>
+      </details>
+      <details class="qa"><summary>机器人策略推理为什么不能直接套 LLM serving？</summary>
+        <p>它是闭环实时控制：batch = 1、看最坏延迟和抖动、多速率（VLM 5–10 Hz、动作 50–200 Hz、底层控制 1 kHz）、多在边缘设备上跑、错过周期有安全后果。核心技术是 action chunking、异步推理 + RTC 平滑拼接、快慢双系统、量化编译与 CUDA graph，以及安全监控和回退。</p>
+      </details>
+      <details class="qa"><summary>Coding agent 的推理负载有什么特殊？怎么优化？</summary>
+        <p>模型是长上下文、会调用工具、带 thinking 的大模型（多为 MoE），经过 SWE 类 agentic RL 训练；会话是几十上百轮的“追加式”上下文，每轮只追加工具输出，前缀几乎全部可复用，轮与轮之间要等工具执行几秒到几分钟。所以：前缀命中率是核心指标；KV 要跨工具空档保留（GPU LRU + CPU / SSD 分层）；路由要会话粘性或 KV 感知；长 prompt 用 chunked prefill 隔离；TPOT 决定 agent 完成时间；tool parser 必须可靠；sandbox 的创建与快照恢复在关键路径上。行内补全则相反：小模型、极低延迟、高 QPS、大量取消；apply / 编辑用原文件做投机 draft。</p>
+      </details>
+      <details class="qa"><summary>AlphaFold 类模型的推理瓶颈在哪里？和 LLM 有什么不同？</summary>
+        <p>成对表示是 N×N×c，三角注意力接近 O(N³)，显存随残基数平方增长，几千残基就要分块甚至 offload；每个复合物单独推理（batch = 1、形状各异）。MSA 搜索在 CPU 上扫 TB 级数据库，常比 GPU 推理还慢，所以要 MMseqs2 加速和缓存。AF3 还有扩散模块和多 seed 采样。精度上以 BF16 / TF32 为主。优化手段：分块、三角注意力专用 kernel（cuEquivariance 等）、MSA 服务化与缓存、按大小分桶调度。</p>
+      </details>
+      <details class="qa"><summary>为什么分子动力学里的 ML 势函数（MLIP）推理更看重延迟而不是吞吐？</summary>
+        <p>MLIP 被嵌在 MD 积分循环里，每个时间步都要算一次能量和力，模拟要跑百万步，而每步只是一个几百到几千原子的小图。总时间 = 步数 × 单步延迟，单步又很小，kernel launch 和小算子开销占主导；等变网络的张量积是计算热点。所以要 CUDA graph、融合的等变 kernel，并保证 FP32 级别的数值稳定性（能量守恒）。</p>
+      </details>
+      <details class="qa"><summary>nvidia-smi 显示 GPU 利用率 100%，为什么吞吐还是很低？</summary>
+        <p>nvidia-smi 的 utilization 只表示“采样窗口内有 kernel 在跑的时间比例”，一个只占用几个 SM 的 memory-bound kernel 也会显示 100%。应该看 MFU / MBU、SM 占用率、Tensor Core 活跃度（DCGM 的 profiling 指标或 Nsight），并检查批大小是否太小、是否有 CPU 空泡。</p>
+      </details>
+      <details class="qa"><summary>什么是 goodput？为什么比 throughput 更合适？</summary>
+        <p>goodput 只统计满足 SLO（如 TTFT &lt; 1 s 且 TPOT &lt; 50 ms）的请求所贡献的吞吐。只看 throughput 时，把批无限加大就能刷高数字，但大量请求已经违约，对业务没有价值。goodput 把延迟约束纳入优化目标，是 DistServe 等工作用来评估 PD 分离的口径。</p>
+      </details>
+    </section>
+
+    <section id="refs">
+      <h2><span class="no">18</span>参考文献与延伸阅读</h2>
+      <div class="cards">
+        <div class="card"><h4>LLM serving 系统</h4><ul>
+          <li><a href="https://www.usenix.org/conference/osdi22/presentation/yu">Orca (OSDI ’22)</a> — iteration-level scheduling</li>
+          <li><a href="https://arxiv.org/abs/2309.06180">vLLM / PagedAttention (SOSP ’23)</a></li>
+          <li><a href="https://arxiv.org/abs/2312.07104">SGLang / RadixAttention</a></li>
+          <li><a href="https://arxiv.org/abs/2403.02310">Sarathi-Serve (OSDI ’24)</a> — chunked prefill</li>
+          <li><a href="https://arxiv.org/abs/2401.09670">DistServe (OSDI ’24)</a> · <a href="https://arxiv.org/abs/2311.18677">Splitwise</a> · <a href="https://arxiv.org/abs/2407.00079">Mooncake</a></li>
+          <li><a href="https://arxiv.org/abs/2406.03243">Llumnix</a> — 请求迁移</li>
+          <li><a href="https://arxiv.org/abs/2311.03285">S-LoRA</a> · <a href="https://arxiv.org/abs/2310.18547">Punica</a></li>
+          <li><a href="https://arxiv.org/abs/2411.15100">XGrammar</a></li>
+        </ul></div>
+        <div class="card"><h4>Kernel、量化、结构</h4><ul>
+          <li><a href="https://arxiv.org/abs/2205.14135">FlashAttention</a> · <a href="https://arxiv.org/abs/2307.08691">FA2</a> · <a href="https://arxiv.org/abs/2407.08608">FA3</a></li>
+          <li><a href="https://arxiv.org/abs/2501.01005">FlashInfer</a></li>
+          <li><a href="https://arxiv.org/abs/2210.17323">GPTQ</a> · <a href="https://arxiv.org/abs/2306.00978">AWQ</a> · <a href="https://arxiv.org/abs/2211.10438">SmoothQuant</a></li>
+          <li><a href="https://arxiv.org/abs/2305.13245">GQA</a> · <a href="https://arxiv.org/abs/2405.04434">DeepSeek-V2（MLA）</a> · <a href="https://arxiv.org/abs/2412.19437">DeepSeek-V3</a></li>
+          <li><a href="https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/">Defeating Nondeterminism in LLM Inference</a></li>
+        </ul></div>
+        <div class="card"><h4>投机解码与并行</h4><ul>
+          <li><a href="https://arxiv.org/abs/2211.17192">Leviathan et al.</a> · <a href="https://arxiv.org/abs/2302.01318">Chen et al.</a></li>
+          <li><a href="https://arxiv.org/abs/2401.10774">Medusa</a> · <a href="https://arxiv.org/abs/2401.15077">EAGLE</a> · <a href="https://arxiv.org/abs/2406.16858">EAGLE-2</a> · <a href="https://arxiv.org/abs/2503.01840">EAGLE-3</a></li>
+          <li><a href="https://arxiv.org/abs/1909.08053">Megatron-LM</a> · <a href="https://arxiv.org/abs/2310.01889">Ring Attention</a> · <a href="https://arxiv.org/abs/2309.14509">DeepSpeed-Ulysses</a></li>
+          <li><a href="https://lmsys.org/blog/2025-05-05-large-scale-ep/">SGLang 大规模 EP</a></li>
+        </ul></div>
+        <div class="card vio"><h4>后训练 / RL</h4><ul>
+          <li><a href="https://arxiv.org/abs/2409.19256">HybridFlow（verl）</a></li>
+          <li><a href="https://arxiv.org/abs/2405.11143">OpenRLHF</a></li>
+          <li><a href="https://arxiv.org/abs/2505.24298">AReaL</a> — 异步 RL</li>
+          <li><a href="https://arxiv.org/abs/2402.03300">DeepSeekMath（GRPO）</a></li>
+        </ul></div>
+        <div class="card vio"><h4>Omni 与扩散</h4><ul>
+          <li><a href="https://arxiv.org/abs/2503.20215">Qwen2.5-Omni</a> · <a href="https://arxiv.org/abs/2509.17765">Qwen3-Omni</a> · <a href="https://arxiv.org/abs/2410.00037">Moshi</a></li>
+          <li><a href="https://arxiv.org/abs/2602.02204">vLLM-Omni</a></li>
+          <li><a href="https://arxiv.org/abs/2212.09748">DiT</a> · <a href="https://arxiv.org/abs/2503.20314">Wan</a></li>
+          <li><a href="https://arxiv.org/abs/2411.01738">xDiT</a> · <a href="https://arxiv.org/abs/2405.07719">USP</a> · <a href="https://arxiv.org/abs/2402.19481">DistriFusion</a> · <a href="https://arxiv.org/abs/2405.14430">PipeFusion</a></li>
+          <li><a href="https://arxiv.org/abs/2312.00858">DeepCache</a> · <a href="https://arxiv.org/abs/2411.19108">TeaCache</a> · <a href="https://arxiv.org/abs/2411.05007">SVDQuant</a></li>
+          <li><a href="https://arxiv.org/abs/2310.04378">LCM</a> · <a href="https://arxiv.org/abs/2405.14867">DMD2</a> · <a href="https://arxiv.org/abs/2502.04507">Sliding Tile Attention</a></li>
+        </ul></div>
+        <div class="card teal"><h4>机器人</h4><ul>
+          <li><a href="https://arxiv.org/abs/2307.15818">RT-2</a> · <a href="https://arxiv.org/abs/2406.09246">OpenVLA</a></li>
+          <li><a href="https://arxiv.org/abs/2410.24164">π0</a> · <a href="https://arxiv.org/abs/2504.16054">π0.5</a> · <a href="https://arxiv.org/abs/2501.09747">FAST</a></li>
+          <li><a href="https://arxiv.org/abs/2503.14734">GR00T N1</a> · <a href="https://arxiv.org/abs/2503.20020">Gemini Robotics</a></li>
+          <li><a href="https://arxiv.org/abs/2304.13705">ACT（action chunking）</a> · <a href="https://arxiv.org/abs/2506.07339">Real-Time Chunking</a> · <a href="https://arxiv.org/abs/2506.01844">SmolVLA</a></li>
+        </ul></div>
+        <div class="card pass"><h4>Coding agent 与 AI for Science</h4><ul>
+          <li><a href="https://arxiv.org/abs/2310.06770">SWE-bench</a> · <a href="https://arxiv.org/abs/2405.15793">SWE-agent</a></li>
+          <li><a href="https://www.nature.com/articles/s41586-021-03819-2">AlphaFold2 (Nature 2021)</a> · <a href="https://www.nature.com/articles/s41586-024-07487-w">AlphaFold3 (Nature 2024)</a></li>
+          <li><a href="https://arxiv.org/abs/2212.12794">GraphCast</a> · <a href="https://arxiv.org/abs/2206.07697">MACE</a></li>
+        </ul></div>
+        <div class="card teal"><h4>Sandbox 与基础设施</h4><ul>
+          <li><a href="https://www.usenix.org/conference/nsdi20/presentation/agache">Firecracker (NSDI ’20)</a></li>
+          <li><a href="https://gvisor.dev/">gVisor</a> · <a href="https://github.com/opensandbox-group/OpenSandbox">OpenSandbox</a></li>
+          <li><a href="https://codewiki.google/">Google Code Wiki</a>：为 GitHub 仓库生成结构化讲解</li>
+          <li><a href="https://github.com/deepseek-ai/open-infra-index">DeepSeek Open Infra Index</a></li>
+          <li><a href="https://en.wikipedia.org/wiki/Roofline_model">Roofline model</a> · <a href="https://en.wikipedia.org/wiki/Little%27s_law">Little’s law</a></li>
+        </ul></div>
+        <div class="card warn"><h4>文档</h4><ul>
+          <li><a href="https://docs.vllm.ai/">vLLM 文档</a> · <a href="https://docs.sglang.ai/">SGLang 文档</a></li>
+          <li><a href="https://nvidia.github.io/TensorRT-LLM/">TensorRT-LLM 文档</a> · <a href="https://docs.nvidia.com/dynamo/latest/">Dynamo 文档</a></li>
+          <li><a href="https://llm-d.ai/">llm-d</a> · <a href="https://vllm-omni.readthedocs.io/en/latest/">vLLM-Omni 文档</a> · <a href="https://sgl-project.github.io/sglang-omni/">SGLang-Omni 文档</a></li>
+        </ul></div>
+      </div>
+    </section>
+  </main>
+</div>

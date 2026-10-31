@@ -1,0 +1,95 @@
+<style>
+/* Front matter for the PDF: full-bleed cover, clickable contents, reading map with the author's statement. */
+@media print {
+  .book-cover { width: auto; height: 268mm; background: var(--land); display: flex; break-after: page; }
+  .cv-frame { margin: 0; flex: 1; border: 1.5px solid var(--coast); outline: 0.6px solid var(--coast); outline-offset: -5px; display: flex; flex-direction: column; padding: 18mm 14mm 12mm; box-shadow: inset 0 0 0 6px var(--land); }
+  .cv-kicker { font-family: var(--font-mono); font-size: 10px; letter-spacing: .32em; color: var(--route); margin: 0; }
+  .cv-title { font-family: var(--font-map); font-weight: 900; font-size: 46px; line-height: 1.12; color: var(--map-ink); margin: 10px 0 0; }
+  .cv-title span { color: var(--route); }
+  .cv-sub { font-family: var(--font-map); font-size: 18px; color: var(--map-ink); margin: 10px 0 0; max-width: none; }
+  .cv-rule { border: 0; border-top: 1px solid var(--coast); margin: 14px 0 10px; width: 60mm; }
+  .cv-topics { font-family: var(--font-map); font-style: italic; font-size: 11.5px; color: var(--map-ink); opacity: .8; margin: 0; max-width: none; }
+  .cv-map { margin: auto 0 0; border: 1px solid var(--coast); border-radius: 6px; overflow: hidden; background: var(--sea); }
+  .cv-map svg { display: block; width: 100%; height: auto; }
+  .cv-foot { display: flex; justify-content: space-between; align-items: flex-end; margin-top: 12mm; font-family: var(--font-map); color: var(--map-ink); }
+  .cv-author { font-size: 11px; letter-spacing: .2em; opacity: .75; display: block; }
+  .cv-author + b { font-size: 22px; font-weight: 700; letter-spacing: .02em; }
+  .cv-ed { font-size: 11.5px; text-align: right; line-height: 1.7; opacity: .85; }
+
+  .book-toc { break-after: page; padding-top: 2mm; }
+  .toc-h { font-family: var(--font-map); font-size: 28px; font-weight: 900; color: var(--map-ink); margin: 0 0 4px; }
+  .toc-kicker { font-family: var(--font-mono); font-size: 10px; letter-spacing: .3em; color: var(--route); margin: 0 0 14px; }
+  .toc-list { list-style: none; margin: 0; padding: 0; border-top: 1.5px solid var(--map-ink); }
+  .toc-list > li { border-bottom: 1px solid var(--line); break-inside: avoid; }
+  .toc-list a { display: flex; align-items: baseline; gap: 10px; text-decoration: none; color: var(--ink); padding: 4.5px 0; }
+  .toc-list .n { font-family: var(--font-mono); font-size: 12px; color: var(--route); width: 26px; flex: none; }
+  .toc-list .t { font-family: var(--font-map); font-size: 14px; font-weight: 700; }
+  .toc-list .k { font-family: var(--font-map); font-style: italic; font-size: 11px; color: var(--muted); margin-left: 4px; }
+  .toc-list .dots { flex: 1; border-bottom: 1px dotted var(--muted); transform: translateY(-4px); min-width: 20px; }
+  .toc-list .p { font-family: var(--font-mono); font-size: 12px; width: 26px; text-align: right; flex: none; }
+  .toc-list ol { list-style: none; margin: -2px 0 6px 36px; padding: 0; }
+  .toc-list ol a { padding: 0.5px 0; }
+  .toc-list ol .t { font-size: 11px; font-weight: 400; font-family: var(--font-body); }
+  .toc-list ol .p { font-size: 11px; color: var(--muted); }
+  .toc-list .front .n { color: var(--muted); }
+
+  .atlas .map-pane .map-fig { width: 90%; margin-inline: auto; }
+  .book-mapnote { margin-top: 10px; border-top: 1px solid var(--coast); padding-top: 10px; font-size: 10.5px; color: var(--muted); line-height: 1.65; }
+  .book-mapnote b { color: var(--ink); }
+  .map-intro .eyebrow, .map-intro h1 { display: none !important; }
+  .map-intro::before { content: "阅读地图"; font-family: var(--font-map); font-size: 26px; font-weight: 900; color: var(--map-ink); }
+}
+@media screen { .book-cover, .book-toc, .book-mapnote { display: none; } }
+</style>
+<script>
+(function () {
+  const AUTHOR = "kzhoulatte";
+  const pages = window.__TOC_PAGES || {};
+  const pg = (id) => (pages[id] !== undefined ? pages[id] : "");
+  const atlas = document.getElementById("atlas");
+
+  // ---------- cover ----------
+  const cover = document.createElement("section");
+  cover.className = "book-cover";
+  cover.innerHTML = `<div class="cv-frame">
+      <p class="cv-kicker">INTERVIEW PREP · SYSTEMS NOTES</p>
+      <h1 class="cv-title">Inference Serving<br><span>全景</span></h1>
+      <p class="cv-sub">从指标、瓶颈到框架与生态</p>
+      <hr class="cv-rule">
+      <p class="cv-topics">LLM · MoE · 大规模集群 · 推理框架 · 后训练 · Omni · 扩散 · 机器人 · Coding Agent · AI for Science · 源码导读</p>
+      <figure class="cv-map"></figure>
+      <div class="cv-foot"><div><span class="cv-author">作 者</span><b>${AUTHOR}</b></div><div class="cv-ed">2026 年 10 月<br>第 1 版</div></div>
+    </div>`;
+  const mapClone = document.getElementById("atlasMap").cloneNode(true);
+  mapClone.querySelectorAll(".here").forEach((n) => n.classList.remove("here"));
+  cover.querySelector(".cv-map").appendChild(mapClone);
+
+  // ---------- contents ----------
+  const toc = document.createElement("section");
+  toc.className = "book-toc";
+  const rows = [`<li class="front"><a href="#mapPane"><span class="n">·</span><span class="t">阅读地图与声明</span><span class="dots"></span><span class="p">${pg("mapPane")}</span></a></li>`];
+  document.querySelectorAll("main.chapter-pane > section").forEach((sec) => {
+    const h2 = sec.querySelector("h2");
+    const no = h2.querySelector(".no").textContent;
+    const title = h2.textContent.slice(no.length);
+    const place = document.querySelector(`#atlasMap .place[data-sec="${sec.id}"] .pl-sub`);
+    let sub = "";
+    if (sec.id === "llm") {
+      sub = "<ol>" + [...sec.querySelectorAll("h3[id]")].map((h) => `<li><a href="#${h.id}"><span class="t">${h.textContent}</span><span class="dots"></span><span class="p">${pg(h.id)}</span></a></li>`).join("") + "</ol>";
+    }
+    rows.push(`<li><a href="#${sec.id}"><span class="n">${no}</span><span class="t">${title}</span>${place ? `<span class="k">${place.textContent}</span>` : ""}<span class="dots"></span><span class="p">${pg(sec.id)}</span></a>${sub}</li>`);
+  });
+  toc.innerHTML = `<p class="toc-kicker">CONTENTS</p><h2 class="toc-h">目录</h2><ol class="toc-list">${rows.join("")}</ol>`;
+
+  atlas.parentNode.insertBefore(cover, atlas);
+  atlas.parentNode.insertBefore(toc, atlas);
+
+  // ---------- statement under the reading map ----------
+  const note = document.createElement("div");
+  note.className = "book-mapnote";
+  note.innerHTML = `<p><b>作者：${AUTHOR}</b>　·　2026 年 10 月　·　第 1 版</p>
+    <p><b>声明。</b>本文由 ${AUTHOR} 编写整理，用于个人学习与面试准备。内容基于公开的论文、官方文档与开源代码，文中的归纳、取舍与观点仅代表作者本人，不代表任何雇主或开源项目。行业与生态信息截至约 2026 年中，可能已经变化；文中源码链接均固定在 2026-10-31 前后的 commit，示意图中的曲线与数字除注明出处者外均为示意。引用或转载请注明作者与出处。</p>
+    <p><b>阅读方式。</b>每章开头的地图截面标出该章在全景图中的位置；正文中的灰色胶囊是可点击的源码链接，◈ 标记的是 Google Code Wiki 链接。</p>`;
+  document.getElementById("mapPane").appendChild(note);
+})();
+</script>

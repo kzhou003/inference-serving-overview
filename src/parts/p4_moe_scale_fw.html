@@ -1,0 +1,253 @@
+
+    <section id="moe">
+      <h2><span class="no">05</span>扩展到 MoE：显存按总参数、计算按激活参数</h2>
+      <p>Mixture-of-Experts 把 FFN 换成 E 个专家，router 为每个 token 选 top-k 个。当前大多数前沿开源模型都是 MoE：</p>
+      <div class="table-box"><table class="num">
+        <thead><tr><th>模型</th><th>总参数 / 激活参数</th><th>专家配置</th><th>注意力</th></tr></thead>
+        <tbody>
+          <tr><td class="k">DeepSeek-V3 / R1</td><td>671B / 37B</td><td>256 路由专家 + 1 共享专家，top-8</td><td>MLA</td></tr>
+          <tr><td class="k">Kimi K2</td><td>约 1T / 32B</td><td>384 专家，top-8</td><td>MLA</td></tr>
+          <tr><td class="k">Qwen3-235B-A22B</td><td>235B / 22B</td><td>128 专家，top-8</td><td>GQA</td></tr>
+          <tr><td class="k">gpt-oss-120b</td><td>约 117B / 5.1B</td><td>128 专家，top-4（MXFP4 权重）</td><td>GQA + 滑动窗口交错</td></tr>
+          <tr><td class="k">Mixtral 8×7B</td><td>47B / 13B</td><td>8 专家，top-2</td><td>GQA</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>MoE：模型特征 → 场景 → 推理负载</h3>
+      <div class="table-box"><table class="chain">
+        <thead><tr><th>模型特征</th><th>为什么这样设计（场景决定）</th><th>在推理负载上的体现</th></tr></thead>
+        <tbody><tr><td>稀疏激活：每 token 只用 top-k 个专家</td><td>在固定的训练与推理 FLOPs 下扩大参数量（知识容量）</td><td>计算按激活参数、显存按总参数；decode 仍要读几乎全部专家权重，但每个专家只分到很少 token → 小而碎的 GEMM</td></tr><tr><td>细粒度专家（256、384 个）+ 共享专家</td><td>细粒度提高专业化程度，共享专家承载通用知识</td><td>每层两次 all-to-all；热门专家导致负载不均 → EPLB 冗余专家；共享专家可本地计算并与通信重叠</td></tr><tr><td>MLA（DeepSeek、Kimi）</td><td>长上下文 + 高并发需要极小的 KV</td><td>KV 小 → 单卡可放更多请求，配合 DP attention 进一步放大 EP 下每专家的批</td></tr><tr><td>MTP 模块</td><td>训练时提供更密的监督信号</td><td>推理时直接当 draft 做投机解码</td></tr><tr><td>原生 FP8 训练（块级 scale）</td><td>降低训练成本</td><td>推理直接使用 FP8 权重与块级 scale GEMM（DeepGEMM），无需额外量化</td></tr></tbody>
+      </table></div>
+      <h3>MoE 让推理更难的地方</h3>
+      <ul class="facts">
+        <li><b>显存：</b>671B 参数 FP8 也要约 700 GB，至少要 8×H200 或跨机。所有专家都要常驻显存，因为任何 token 都可能路由到任何专家。</li>
+        <li><b>decode 时专家 GEMM 极小：</b>批里 B 个 token，每个选 k 个专家，平均每个专家只分到 <code>B·k/E</code> 个 token。DeepSeek-V3 在 B=64 时：被激活的专家数 ≈ <code>E·(1−(1−k/E)^B)</code> ≈ 222 个（几乎全部），平均每个专家只有约 2.3 个 token。结果是几乎要读全部专家权重，却每个只做极小的矩阵乘 —— 严重 memory-bound。</li>
+        <li><b>通信：</b>专家分在不同 GPU 上，每个 MoE 层要两次 all-to-all（dispatch 把 token 发给专家，combine 把结果收回），延迟敏感且量大。</li>
+        <li><b>负载不均：</b>热门专家所在的 GPU 成为瓶颈，整个层等最慢的那张卡。训练时可以用 capacity factor 丢 token，推理时不能丢。</li>
+      </ul>
+      <div class="callout"><b class="h">关键洞察：用“宽 EP”把每专家批做大</b>
+        <p>如果把 256 个专家分到 128 张卡上，每张卡只放 2 个专家：显存省下来放 KV（并发更多），同时全局所有请求的 token 会汇聚到少数专家上，每个专家的有效批变大，GEMM 回到高效区。这就是 DeepSeek 推理系统的核心思路：<b>attention 用数据并行（DP，每卡处理自己的请求），MoE 用大规模专家并行（EP）</b>。</p>
+      </div>
+      <figure class="figure" id="fig-ep"><div class="fig-body"></div>
+        <figcaption><b>一个 MoE 层的数据流（DP attention + EP experts）。</b>每张卡先对自己的请求做 attention 和 gate；dispatch 用 all-to-all 把 token 发到专家所在的卡；专家做 grouped GEMM；combine 再用 all-to-all 把结果按 gate 权重加回原卡。共享专家在本地算，可与通信重叠。</figcaption>
+      </figure>
+      <script>
+      flow("fig-ep", { w: 960, h: 360, label: "MoE 专家并行数据流", nodes: [
+        { id: "a0", x: 95, y: 80, t: "GPU 0 · attention", s: "DP：自己的请求 + KV", k: "acc", w: 170 },
+        { id: "a1", x: 95, y: 200, t: "GPU 1 · attention", s: "DP：自己的请求 + KV", k: "acc", w: 170 },
+        { id: "aN", x: 95, y: 300, t: "GPU N …", k: "acc", w: 170, h: 36 },
+        { id: "g", x: 300, y: 190, t: "Gate / Router", s: "每 token 选 top-k\n+ 权重", k: "warn", w: 150 },
+        { id: "dis", x: 480, y: 190, t: "Dispatch", s: "all-to-all\nDeepEP", k: "vio", w: 120 },
+        { id: "e0", x: 660, y: 80, t: "专家 0,1 (+冗余)", s: "grouped GEMM", k: "pass", w: 170 },
+        { id: "e1", x: 660, y: 190, t: "专家 2,3", s: "grouped GEMM", k: "pass", w: 170 },
+        { id: "eN", x: 660, y: 300, t: "专家 …", k: "pass", w: 170, h: 36 },
+        { id: "com", x: 860, y: 190, t: "Combine", s: "all-to-all\n加权求和回原卡", k: "vio", w: 130 },
+        { id: "sh", x: 300, y: 60, t: "共享专家", s: "本地计算，与通信重叠", k: "teal", w: 170 }
+      ], edges: [
+        { f: "a0", t: "g", k: "acc" }, { f: "a1", t: "g", k: "acc" }, { f: "aN", t: "g", k: "acc" },
+        { f: "g", t: "dis", k: "warn" }, { f: "dis", t: "e0", k: "vio", a: true }, { f: "dis", t: "e1", k: "vio", a: true }, { f: "dis", t: "eN", k: "vio", a: true },
+        { f: "e0", t: "com", k: "pass" }, { f: "e1", t: "com", k: "pass" }, { f: "eN", t: "com", k: "pass" },
+        { f: "a0", t: "sh", k: "teal", d: true }, { f: "sh", t: "com", k: "teal", d: true, fs: "r", ts: "t", st: true }
+      ]});
+      </script>
+
+      <h3>MoE serving 的技术栈</h3>
+      <div class="table-box"><table>
+        <thead><tr><th>问题</th><th>技术</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td class="k">all-to-all 慢</td><td>DeepEP（DeepSeek 开源）</td><td>两套 kernel：<i>normal</i>（高吞吐，用于 prefill，NVLink + RDMA 转发）和 <i>low-latency</i>（纯 RDMA，用于 decode，hook 式通信不占用 SM，便于和计算重叠、兼容 CUDA graph）。同类还有 Perplexity 的 pplx-kernels、基于 NVSHMEM 的实现</td></tr>
+          <tr><td class="k">通信无法隐藏</td><td>Two-Batch Overlap（TBO）/ 微批重叠</td><td>把一个批切成两个微批，一个在做 attention / 专家计算时另一个在做 dispatch / combine</td></tr>
+          <tr><td class="k">专家负载不均</td><td>EPLB（Expert Parallel Load Balancer）</td><td>根据统计把热门专家复制成冗余副本（DeepSeek prefill 时用 32 个冗余专家），并重新摆放；分层模式（先按节点组均衡）与全局模式；可在线周期性重排</td></tr>
+          <tr><td class="k">专家 GEMM 小而碎</td><td>Grouped GEMM（DeepGEMM、CUTLASS、Triton fused MoE）</td><td>DeepGEMM 提供 prefill 用的 contiguous 布局和 decode 用的 masked 布局（形状固定，便于 CUDA graph）；FP8 细粒度 scale</td></tr>
+          <tr><td class="k">MLA 不好做 TP</td><td>DP attention</td><td>MLA 的 latent 只有一份，TP 切 head 会复制 KV；改为每卡独立处理不同请求的 attention，KV 不重复</td></tr>
+          <tr><td class="k">显存不够</td><td>FP8 / FP4 专家权重</td><td>专家权重占绝大部分，量化收益最大</td></tr>
+          <tr><td class="k">单卡故障影响整个实例</td><td>弹性 EP / 冗余专家</td><td>上百卡组成一个推理实例时，故障半径很大，需要专家迁移与快速恢复</td></tr>
+        </tbody>
+      </table></div>
+      <figure class="figure" id="fig-tbo"><div class="fig-body"></div>
+        <figcaption><b>Two-Batch Overlap。</b>上：单批时计算和通信串行，GPU 在等网络。下：拆成微批 1、2，一个的通信与另一个的计算重叠，总时间缩短。</figcaption>
+      </figure>
+      <script>
+      gantt("fig-tbo", { w: 920, max: 36, labelW: 150, rowH: 26, top: 18, rows: ["单批 · 计算", "单批 · 通信", "", "TBO · 计算", "TBO · 通信"], ticks: 4, tickLabels: false, axis: "一个 MoE 层的时间 →", bars: [
+        { r: 0, s: 0, e: 8, t: "attn", k: "acc" }, { r: 1, s: 8, e: 14, t: "dispatch", k: "vio" }, { r: 0, s: 14, e: 22, t: "experts", k: "pass" }, { r: 1, s: 22, e: 28, t: "combine", k: "vio" },
+        { r: 3, s: 0, e: 4, t: "attn₁", k: "acc" }, { r: 3, s: 4, e: 8, t: "attn₂", k: "acc" }, { r: 4, s: 4, e: 7, t: "disp₁", k: "vio" }, { r: 3, s: 8, e: 12, t: "exp₁", k: "pass" },
+        { r: 4, s: 8, e: 11, t: "disp₂", k: "vio" }, { r: 3, s: 12, e: 16, t: "exp₂", k: "pass" }, { r: 4, s: 12, e: 15, t: "comb₁", k: "vio" }, { r: 4, s: 16, e: 19, t: "comb₂", k: "vio" }
+      ], marks: [{ x: 28, t: "串行结束", k: "todo" }, { x: 19, t: "重叠后结束", k: "pass" }]});
+      </script>
+
+      <div class="srcs"><span class="srcs-label">源码</span>{{s:vllm-project/vllm:vllm/model_executor/layers/fused_moe/layer.py|vLLM FusedMoE layer}}{{s:vllm-project/vllm:vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_ll.py|vLLM DeepEP low-latency}}{{s:vllm-project/vllm:vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_ht.py|DeepEP high-throughput}}{{s:vllm-project/vllm:vllm/distributed/eplb|vLLM EPLB}}{{s:sgl-project/sglang:python/sglang/srt/layers/moe/token_dispatcher|SGLang token_dispatcher}}{{s:sgl-project/sglang:python/sglang/srt/batch_overlap/two_batch_overlap.py|SGLang two_batch_overlap.py}}{{s:sgl-project/sglang:python/sglang/srt/eplb|SGLang eplb/}}{{s:deepseek-ai/EPLB:eplb.py|DeepSeek eplb.py}}{{s:deepseek-ai/DeepEP:csrc/kernels|DeepEP kernels}}</div>
+      <h3>案例：DeepSeek-V3/R1 的线上推理系统</h3>
+      <p>DeepSeek 在 2025 年 2 月的 Open Infra 周最后一天公开了线上系统概况，是面试中讲 MoE serving 最好的例子：</p>
+      <ul class="facts">
+        <li><b>PD 分离 + 不同并行度：</b>prefill 阶段每个部署单元 4 个节点（32 卡），路由专家 EP32、MLA 与共享专家 DP32；decode 阶段每单元 18 个节点（144 卡），EP144、DP144。</li>
+        <li><b>重叠：</b>prefill 用双微批重叠，decode 把 attention 切成两段做 5 级流水的重叠。</li>
+        <li><b>负载均衡：</b>prefill、decode 和 attention 各有自己的均衡器（专家冗余、按 KV 使用量与请求数分配请求）。</li>
+        <li><b>结果（公开数字，H800）：</b>平均每节点 prefill 约 73.7k token/s（含 cache 命中）、decode 约 14.8k token/s；理论成本利润率 545%。</li>
+        <li>SGLang 团队随后在 96 张 H100 上用 PD 分离 + 大规模 EP 开源复现，2k 输入时每节点约 52.3k 输入 token/s、22.3k 输出 token/s。</li>
+      </ul>
+      <div class="srcs"><span class="srcs-label">阅读</span>
+        <a class="src" href="https://github.com/deepseek-ai/open-infra-index/blob/main/202502OpenSourceWeek/day_6_one_more_thing_deepseekV3R1_inference_system_overview.md">DeepSeek 推理系统概览 ↗</a>
+        <a class="src" href="https://lmsys.org/blog/2025-05-05-large-scale-ep/">SGLang 大规模 EP 博客 ↗</a>
+        <a class="src" href="https://github.com/deepseek-ai/DeepEP">DeepEP ↗</a>
+        <a class="src" href="https://github.com/deepseek-ai/DeepGEMM">DeepGEMM ↗</a>
+        <a class="src" href="https://github.com/deepseek-ai/EPLB">EPLB ↗</a>
+      </div>
+      <p>机柜级硬件（GB200 / GB300 NVL72）把 72 卡放进一个 NVLink 域，宽 EP 的 all-to-all 可以完全走 NVLink，是当前超大 MoE 部署的主流形态。</p>
+    </section>
+
+    <section id="scale">
+      <h2><span class="no">06</span>扩展到大规模集群</h2>
+      <p>单个引擎实例优化到头之后，问题变成集群层面的：几百上千张 GPU、多个模型、PD 两个池、跨机实例、流量波动、硬件故障。这一层的软件叫 orchestration / control plane，它不替代 vLLM / SGLang，而是管理一群引擎实例。</p>
+      <figure class="figure" id="fig-cluster"><div class="fig-body"></div>
+        <figcaption><b>集群推理的分层。</b>API 网关负责鉴权、限流、计费；推理网关（路由器）按 KV 命中和负载选实例；实例按 PD 分池，跨机实例用 LeaderWorkerSet 等方式编排；分布式 KV 池在实例间共享前缀；控制面根据 SLO 指标扩缩各个池。</figcaption>
+      </figure>
+      <script>
+      flow("fig-cluster", { w: 980, h: 440, label: "集群推理架构", nodes: [
+        { id: "u", x: 70, y: 200, t: "Clients", s: "应用 / agent", w: 110 },
+        { id: "gw", x: 225, y: 200, t: "API Gateway", s: "鉴权 · 限流 · 计费\n模型路由", k: "acc", w: 150 },
+        { id: "rt", x: 410, y: 200, t: "推理网关 / Router", s: "KV 感知 · 负载感知\nLoRA 感知 · 会话粘性", k: "acc", w: 170 },
+        { id: "p", x: 640, y: 95, t: "Prefill 池", s: "N 个实例", k: "warn", w: 140 },
+        { id: "d", x: 640, y: 225, t: "Decode 池", s: "M 个实例（可跨机 EP）", k: "pass", w: 170 },
+        { id: "kv", x: 870, y: 160, t: "分布式 KV 池", s: "HBM → DRAM → SSD\nMooncake / LMCache", k: "vio", w: 170 },
+        { id: "pl", x: 410, y: 370, t: "Planner / Autoscaler", s: "按 TTFT、TPOT、队列\n调 P、D 实例数", k: "teal", w: 180 },
+        { id: "mx", x: 640, y: 370, t: "Metrics", s: "Prometheus · 事件流\nKV 事件 · 队列长度", k: "teal", w: 170 },
+        { id: "k8", x: 870, y: 370, t: "K8s / 调度器", s: "LWS · 拓扑感知\n权重缓存 · 镜像", k: "teal", w: 160 }
+      ], edges: [
+        { f: "u", t: "gw", k: "acc" }, { f: "gw", t: "rt", k: "acc" }, { f: "rt", t: "p", k: "warn" }, { f: "rt", t: "d", k: "pass" },
+        { f: "p", t: "d", k: "vio", a: true, l: "KV 传输" }, { f: "p", t: "kv", k: "vio", both: true, d: true }, { f: "d", t: "kv", k: "vio", both: true, d: true },
+        { f: "d", t: "mx", k: "teal", d: true, fs: "b", ts: "t" }, { f: "mx", t: "pl", k: "teal" }, { f: "pl", t: "k8", k: "teal", fs: "b", ts: "b", st: true, my: 425, l: "扩 / 缩" },
+        { f: "mx", t: "rt", k: "teal", d: true, fs: "l", ts: "b", st: true, l: "实时负载 + 缓存视图" }
+      ], groups: [{ x: 555, y: 50, w: 420, h: 230, t: "数据面 · GPU 实例", k: "pass" }, { x: 310, y: 315, w: 665, h: 120, t: "控制面", k: "teal" }]});
+      </script>
+
+      <h3>路由：命中率和负载均衡的权衡</h3>
+      <div class="srcs"><span class="srcs-label">源码</span>{{s:ai-dynamo/dynamo:lib/llm/src/kv_router|Dynamo kv_router}}{{s:ai-dynamo/dynamo:lib/kv-router/src|Dynamo kv-router crate}}{{s:llm-d/llm-d-router:pkg/epp|llm-d EPP（选实例）}}{{s:sgl-project/sglang:sgl-model-gateway/src|SGLang Model Gateway (Rust)}}{{s:vllm-project/aibrix:pkg/plugins/gateway|AIBrix gateway}}{{r:kubernetes-sigs/gateway-api-inference-extension|Gateway API Inference Ext.}}</div>
+      <ul class="facts">
+        <li><b>轮询 / 最少连接</b>会把同一会话打散到不同实例，前缀 cache 几乎失效。</li>
+        <li><b>会话粘性 / 一致性哈希</b>提高命中，但热点会把某个实例打爆。</li>
+        <li><b>KV 感知路由</b>：路由器维护每个实例缓存了哪些 block（通过引擎上报的 KV 事件，或近似 radix tree），对每个候选实例算 “命中可省的 prefill 量 − 负载代价”。代表：NVIDIA Dynamo KV Router、llm-d 的 inference scheduler（prefix-cache scorer）、SGLang Model Gateway（原 sgl-router）的 cache-aware 策略、AIBrix router。</li>
+        <li><b>Kubernetes 标准化</b>：Gateway API Inference Extension 定义了 <code>InferencePool</code> 和 endpoint picker，把“模型感知的选实例”做成 K8s 网关的扩展点，llm-d 等基于它实现。</li>
+      </ul>
+
+      <h3>扩缩容与冷启动</h3>
+      <div class="srcs"><span class="srcs-label">源码</span>{{s:ai-dynamo/dynamo:components/src/dynamo/global_planner|Dynamo planner}}{{s:vllm-project/aibrix:pkg/controller|AIBrix controller}}{{r:vllm-project/production-stack|production-stack}}{{r:kubernetes-sigs/lws|LeaderWorkerSet}}</div>
+      <ul class="facts">
+        <li><b>别用 GPU 利用率当信号</b>：decode 时 nvidia-smi 的 util 几乎总是 100%。应看队列长度、KV 使用率、TTFT / TPOT 的 SLO 违约率。PD 分离时 P 和 D 分开扩（Dynamo Planner 就是做这个）。</li>
+        <li><b>冷启动链路</b>：调度 GPU 节点 → 拉镜像（几十 GB）→ 加载权重（几百 GB，从对象存储 → 本地 NVMe → 显存）→ torch.compile / CUDA graph 预热。优化手段：权重预放到节点、并行流式加载（Run:ai Model Streamer、fastsafetensors）、节点间 P2P 分发权重、编译缓存、GPU 进程快照（如 Modal 的 GPU memory snapshot、CUDA checkpoint）。</li>
+        <li><b>多模型共用 GPU</b>：vLLM 的 sleep mode（释放权重 / KV 显存，秒级唤醒）、多 LoRA、按需加载，适合长尾模型。</li>
+      </ul>
+
+      <h3>可靠性</h3>
+      <ul class="facts">
+        <li>一个宽 EP 实例跨 18 个节点时，任意一张卡出错整个实例就挂；需要健康检查、快速剔除、请求重试、专家迁移。</li>
+        <li>请求迁移：Llumnix（OSDI ’24）在实例间实时迁移请求（连同 KV），用于负载均衡、降级和优雅下线。</li>
+        <li>流量削峰：Batch API（离线任务，24 小时内完成，通常半价）填平低谷；优先级让在线请求先走。</li>
+      </ul>
+
+      <h3>集群层的开源项目</h3>
+      <div class="table-box"><table>
+        <thead><tr><th>项目</th><th>来源</th><th>定位</th><th>关键能力</th></tr></thead>
+        <tbody>
+          <tr><td class="k"><a href="https://github.com/ai-dynamo/dynamo">NVIDIA Dynamo</a></td><td>NVIDIA（2025 GTC 开源）</td><td>引擎无关的分布式推理框架</td><td>PD 分离、KV 感知路由、KVBM 多级 KV、NIXL 传输、Planner 自动扩缩；后端可接 vLLM / SGLang / TRT-LLM</td></tr>
+          <tr><td class="k"><a href="https://github.com/llm-d/llm-d">llm-d</a></td><td>Red Hat、Google、IBM、NVIDIA、CoreWeave 等</td><td>K8s 原生的分布式推理栈</td><td>基于 vLLM + Gateway API Inference Extension；前缀感知调度、PD 分离、宽 EP 方案</td></tr>
+          <tr><td class="k"><a href="https://github.com/vllm-project/aibrix">AIBrix</a></td><td>字节跳动，vLLM 社区</td><td>K8s 上的 LLM 控制面</td><td>LoRA 管理、LLM 专用 autoscaler、路由、分布式 KV cache、异构 GPU</td></tr>
+          <tr><td class="k"><a href="https://github.com/vllm-project/production-stack">vLLM production-stack</a></td><td>vLLM 社区 + LMCache</td><td>参考部署栈</td><td>Helm、路由、LMCache、可观测性</td></tr>
+          <tr><td class="k"><a href="https://github.com/kserve/kserve">KServe</a></td><td>CNCF</td><td>K8s 模型服务标准</td><td>InferenceService CRD，LLM 场景集成 llm-d</td></tr>
+          <tr><td class="k"><a href="https://docs.ray.io/en/latest/serve/index.html">Ray Serve</a></td><td>Anyscale</td><td>Python 原生的服务编排</td><td>多模型组合、自动扩缩、Ray Serve LLM 封装 vLLM</td></tr>
+          <tr><td class="k"><a href="https://github.com/kubernetes-sigs/lws">LeaderWorkerSet</a></td><td>K8s SIG</td><td>多节点 Pod 组</td><td>一个推理实例跨多机时作为整体调度、整体重启</td></tr>
+          <tr><td class="k"><a href="https://github.com/kvcache-ai/Mooncake">Mooncake</a> / <a href="https://github.com/LMCache/LMCache">LMCache</a></td><td>Moonshot + 清华 / LMCache 团队</td><td>KV 存储与传输层</td><td>Transfer Engine（RDMA）、分布式 KV store；被 vLLM、SGLang、Dynamo 集成</td></tr>
+          <tr><td class="k"><a href="https://github.com/ai-dynamo/nixl">NIXL</a></td><td>NVIDIA</td><td>点对点数据传输库</td><td>统一 GPU / CPU / 存储之间的异步传输，PD 分离的 KV 传输常用后端</td></tr>
+        </tbody>
+      </table></div>
+    </section>
+
+    <section id="frameworks">
+      <h2><span class="no">07</span>LLM 推理框架</h2>
+      <p>引擎（engine）负责单个实例里的调度、KV 管理和执行；上一节的 orchestration 负责一群实例。面试最常被问的是 vLLM 和 SGLang 的架构和区别。</p>
+
+      <h3>vLLM</h3>
+      <div class="srcs"><span class="srcs-label">精读顺序</span>{{s:vllm-project/vllm:vllm/entrypoints/openai/api_server.py|① api_server.py}}{{s:vllm-project/vllm:vllm/v1/engine/async_llm.py|② async_llm.py}}{{s:vllm-project/vllm:vllm/v1/engine/core.py|③ engine/core.py}}{{s:vllm-project/vllm:vllm/v1/core/sched/scheduler.py|④ scheduler.py}}{{s:vllm-project/vllm:vllm/v1/core/kv_cache_manager.py|⑤ kv_cache_manager.py}}{{s:vllm-project/vllm:vllm/v1/worker/gpu_worker.py|⑥ gpu_worker.py}}{{s:vllm-project/vllm:vllm/v1/worker/gpu_model_runner.py|⑦ gpu_model_runner.py}}{{s:vllm-project/vllm:vllm/v1/attention/backends/flash_attn.py|⑧ attention backend}}{{w:vllm-project/vllm|vLLM · Code Wiki}}</div>
+      <p>2023 年出自 UC Berkeley Sky Computing Lab（PagedAttention 论文），现为 PyTorch Foundation 托管项目，是模型和硬件覆盖最广的开源引擎。2025 年起 V1 架构成为默认实现。2026 年 1 月核心作者创立 Inferact（a16z、Lightspeed 领投 1.5 亿美元种子轮）做商业化。</p>
+      <figure class="figure" id="fig-vllm"><div class="fig-body"></div>
+        <figcaption><b>vLLM V1 进程结构。</b>前端进程（可多个 API server）做 HTTP、输入处理（tokenize、多模态预处理）和输出处理（detokenize）；EngineCore 是独立进程，跑一个忙循环：调度 → 执行 → 更新状态；Executor 把每步下发到每张 GPU 上的 Worker。进程间用 ZMQ + msgpack 通信，让 CPU 工作与 GPU 执行并行。</figcaption>
+      </figure>
+      <script>
+      flow("fig-vllm", { w: 980, h: 360, label: "vLLM V1 架构", nodes: [
+        { id: "http", x: 90, y: 70, t: "OpenAI API server", s: "FastAPI · 可多进程", k: "acc", w: 170 },
+        { id: "inp", x: 90, y: 170, t: "Processor", s: "chat template · tokenize\n多模态预处理", k: "acc", w: 170 },
+        { id: "outp", x: 90, y: 280, t: "OutputProcessor", s: "增量 detokenize · stop", k: "acc", w: 170 },
+        { id: "core", x: 380, y: 70, t: "EngineCore 忙循环", s: "schedule → execute → update", k: "dark", w: 210 },
+        { id: "sch", x: 380, y: 170, t: "Scheduler", s: "统一 token 预算\nchunked prefill · 投机", k: "warn", w: 180 },
+        { id: "kvm", x: 380, y: 280, t: "KVCacheManager", s: "block pool · 前缀哈希\nhybrid allocator", k: "warn", w: 180 },
+        { id: "ex", x: 630, y: 170, t: "Executor", s: "单进程 / 多进程 / Ray", k: "vio", w: 160 },
+        { id: "w0", x: 860, y: 90, t: "Worker · GPU0", s: "GPUModelRunner\npersistent batch", k: "pass", w: 170 },
+        { id: "w1", x: 860, y: 190, t: "Worker · GPU1", s: "…TP / PP / EP rank", k: "pass", w: 170 },
+        { id: "att", x: 860, y: 295, t: "执行层", s: "torch.compile + CUDA graph\nFlashAttn / FlashInfer / MLA", k: "pass", w: 200 }
+      ], edges: [
+        { f: "http", t: "inp", k: "acc" }, { f: "inp", t: "core", k: "acc", l: "ZMQ", fs: "r", ts: "l" }, { f: "core", t: "outp", k: "acc", l: "ZMQ 输出", fs: "l", ts: "r", fo: 8 },
+        { f: "core", t: "sch", k: "warn" }, { f: "sch", t: "kvm", k: "warn", both: true },
+        { f: "core", t: "ex", k: "vio", fs: "r", ts: "t" }, { f: "ex", t: "w0", k: "pass" }, { f: "ex", t: "w1", k: "pass" }, { f: "w1", t: "att", k: "pass", d: true }
+      ], groups: [{ x: 0, y: 25, w: 185, h: 300, t: "前端进程" }, { x: 270, y: 25, w: 225, h: 300, t: "EngineCore 进程", k: "warn" }, { x: 760, y: 25, w: 215, h: 320, t: "GPU workers", k: "pass" }]});
+      </script>
+      <ul class="facts">
+        <li><b>特点：</b>模型覆盖最全（文本、多模态、embedding / reward / pooling）；硬件最广（CUDA、ROCm、TPU、Gaudi、XPU、CPU，以及 vllm-ascend 等插件）；插件化的 KV connector（PD 分离）、attention backend、量化方法；投机解码（EAGLE、MTP、n-gram）；多 LoRA；结构化输出；RL 集成（sleep mode、权重热更新）。</li>
+        <li><b>周边：</b>vLLM-Omni（多模态生成）、llm-d、production-stack、AIBrix、llm-compressor、guidellm（压测）、semantic-router（意图路由）。</li>
+      </ul>
+
+      <h3>SGLang</h3>
+      <div class="srcs"><span class="srcs-label">精读顺序</span>{{s:sgl-project/sglang:python/sglang/srt/entrypoints/http_server.py|① http_server.py}}{{s:sgl-project/sglang:python/sglang/srt/managers/tokenizer_manager.py|② tokenizer_manager.py}}{{s:sgl-project/sglang:python/sglang/srt/managers/scheduler.py|③ scheduler.py}}{{s:sgl-project/sglang:python/sglang/srt/managers/schedule_policy.py|④ schedule_policy.py}}{{s:sgl-project/sglang:python/sglang/srt/mem_cache/radix_cache.py|⑤ radix_cache.py}}{{s:sgl-project/sglang:python/sglang/srt/managers/tp_worker.py|⑥ tp_worker.py}}{{s:sgl-project/sglang:python/sglang/srt/model_executor/model_runner.py|⑦ model_runner.py}}{{s:sgl-project/sglang:python/sglang/srt/managers/detokenizer_manager.py|⑧ detokenizer_manager.py}}{{w:sgl-project/sglang|SGLang · Code Wiki}}</div>
+      <p>2023 年底出自 LMSYS（Berkeley / Stanford 等），最初是“前端结构化生成语言 + 高效运行时（SRT）”，以 RadixAttention 闻名，后来在 DeepSeek 大规模 EP、结构化输出、RL rollout 方面成为主力引擎之一。2026 年核心团队成立 RadixArk（Accel 领投），继续维护开源 SGLang 并开发 RL 框架 Miles。</p>
+      <figure class="figure" id="fig-sgl"><div class="fig-body"></div>
+        <figcaption><b>SGLang 运行时进程结构。</b>TokenizerManager 在主进程里接 HTTP 请求并 tokenize，通过 ZMQ 发给 Scheduler；每个 GPU（TP rank）一个 Scheduler 进程，内部管理 RadixCache、组批、调用 ModelRunner；输出 token 发给 DetokenizerManager，再回到 TokenizerManager 流式返回。重叠调度让 CPU 准备下一批与 GPU 计算并行。</figcaption>
+      </figure>
+      <script>
+      flow("fig-sgl", { w: 980, h: 250, label: "SGLang 架构", nodes: [
+        { id: "h", x: 80, y: 80, t: "HTTP server", s: "FastAPI · OpenAI API", k: "acc", w: 150 },
+        { id: "tm", x: 290, y: 80, t: "TokenizerManager", s: "tokenize · 多模态处理\n请求状态", k: "acc", w: 180 },
+        { id: "s", x: 540, y: 80, t: "Scheduler（每 TP rank）", s: "组批 · RadixCache\noverlap scheduling", k: "warn", w: 200 },
+        { id: "mr", x: 820, y: 80, t: "TpModelWorker", s: "ModelRunner · CUDA graph\nFlashInfer / FA3 / FlashMLA", k: "pass", w: 210 },
+        { id: "rc", x: 540, y: 210, t: "RadixCache / HiCache", s: "前缀树 · LRU · 分层存储", k: "vio", w: 200 },
+        { id: "dt", x: 290, y: 210, t: "DetokenizerManager", s: "增量 detokenize", k: "acc", w: 180 }
+      ], edges: [
+        { f: "h", t: "tm", k: "acc" }, { f: "tm", t: "s", k: "acc", l: "ZMQ" }, { f: "s", t: "mr", k: "pass", both: true }, { f: "s", t: "rc", k: "vio", both: true },
+        { f: "s", t: "dt", k: "acc", l: "ZMQ token ids", fs: "b", ts: "r", fo: -60, lx: -40, ly: -12 }, { f: "dt", t: "tm", k: "acc" }, { f: "tm", t: "h", k: "acc", d: true, fs: "b", ts: "b", st: true, my: 150, l: "流式" }
+      ]});
+      </script>
+      <ul class="facts">
+        <li><b>特点：</b>RadixAttention 与 cache-aware 调度；零开销 overlap scheduler；DP attention + DeepEP / DeepGEMM / EPLB / TBO 的大规模 EP；PD 分离（Mooncake / NIXL）；EAGLE-2/3 投机；HiCache 分层 KV；sgl-kernel 自有 kernel 库；SGLang Model Gateway（Rust 写的路由器）。</li>
+        <li><b>RL 生态：</b>verl、slime、AReaL、Miles 等都把 SGLang 作为 rollout 引擎（见 <a href="#posttrain">08</a>）。</li>
+        <li><b>扩展：</b>SGLang Diffusion（图像 / 视频生成）、SGLang-Omni（多阶段语音与 omni 模型）、TPU 后端（SGLang-JAX）。</li>
+      </ul>
+
+      <h3>vLLM vs SGLang：面试怎么答</h3>
+      <div class="table-box"><table>
+        <thead><tr><th>维度</th><th>vLLM</th><th>SGLang</th></tr></thead>
+        <tbody>
+          <tr><td class="k">起点</td><td>PagedAttention，解决 KV 显存</td><td>RadixAttention + 前端 DSL，解决复杂 LLM 程序的前缀复用</td></tr>
+          <tr><td class="k">前缀缓存</td><td>block 哈希（APC），默认开启</td><td>radix tree，cache-aware 调度</td></tr>
+          <tr><td class="k">调度</td><td>V1 统一 token 预算；async scheduling</td><td>overlap scheduler（CPU / GPU 流水）</td></tr>
+          <tr><td class="k">强项</td><td>模型与硬件覆盖、插件生态、企业部署（Red Hat、llm-d）</td><td>DeepSeek 类 MoE 大规模部署、结构化输出、RL rollout</td></tr>
+          <tr><td class="k">共同点</td><td colspan="2">continuous batching、paged KV、chunked prefill、PD 分离、投机解码、CUDA graph、FP8/FP4、多 LoRA、OpenAI API；都大量使用 FlashInfer、FlashAttention、DeepGEMM 等共享 kernel。两者的性能差距随版本和负载变化，结论应来自自己负载上的基准测试。</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>其他引擎</h3>
+      <div class="srcs"><span class="srcs-label">源码</span>{{s:NVIDIA/TensorRT-LLM:tensorrt_llm/_torch/pyexecutor/py_executor.py|TRT-LLM py_executor.py}}{{s:NVIDIA/TensorRT-LLM:tensorrt_llm/_torch/pyexecutor/resource_manager.py|resource_manager.py}}{{s:ggml-org/llama.cpp:src/llama-kv-cache.cpp|llama.cpp kv-cache}}{{s:ggml-org/llama.cpp:tools/server|llama.cpp server}}{{w:NVIDIA/TensorRT-LLM|TRT-LLM · Code Wiki}}{{w:ggml-org/llama.cpp|llama.cpp · Code Wiki}}</div>
+      <div class="table-box"><table>
+        <thead><tr><th>引擎</th><th>来源</th><th>定位与特点</th></tr></thead>
+        <tbody>
+          <tr><td class="k"><a href="https://github.com/NVIDIA/TensorRT-LLM">TensorRT-LLM</a></td><td>NVIDIA</td><td>NVIDIA 硬件上 kernel 最激进（XQA attention、Blackwell FP4、wide EP）；早期需要编译 TensorRT engine，1.0 起以 PyTorch 后端为主；与 Dynamo、Triton Inference Server 集成。只支持 NVIDIA</td></tr>
+          <tr><td class="k"><a href="https://github.com/InternLM/lmdeploy">LMDeploy</a></td><td>上海 AI Lab</td><td>TurboMind（C++）+ PyTorch 双引擎；W4A16 量化与 VLM 支持好</td></tr>
+          <tr><td class="k"><a href="https://github.com/huggingface/text-generation-inference">TGI</a></td><td>Hugging Face</td><td>开源 continuous batching 的早期实现之一（Rust 路由 + Python 模型）；据报道 2025 年底进入维护模式，官方引导新部署使用 vLLM / SGLang</td></tr>
+          <tr><td class="k"><a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a> / <a href="https://github.com/ollama/ollama">Ollama</a></td><td>社区</td><td>本地与边缘：CPU、Apple Silicon、Vulkan；GGUF 量化；Ollama 在其上做模型管理与易用 API。并发能力有限</td></tr>
+          <tr><td class="k"><a href="https://github.com/ml-explore/mlx">MLX</a></td><td>Apple</td><td>Apple Silicon 上的数组框架，mlx-lm 用于本地推理</td></tr>
+          <tr><td class="k"><a href="https://github.com/mlc-ai/mlc-llm">MLC-LLM</a></td><td>CMU / OctoAI 背景</td><td>基于 TVM 编译到多后端，包括浏览器 WebGPU（WebLLM）和手机</td></tr>
+          <tr><td class="k"><a href="https://github.com/kvcache-ai/ktransformers">KTransformers</a></td><td>清华 MADSys</td><td>CPU + GPU 异构：专家放 CPU 内存、attention 放 GPU，单机跑超大 MoE</td></tr>
+          <tr><td class="k">DeepSpeed-FastGen</td><td>Microsoft</td><td>Dynamic SplitFuse（与 chunked prefill 思路相同），目前较少更新</td></tr>
+          <tr><td class="k">Modular MAX</td><td>Modular</td><td>Mojo 写的跨硬件推理引擎</td></tr>
+          <tr><td class="k">TPU 系</td><td>Google 等</td><td>JetStream / MaxText、vLLM TPU 后端、SGLang-JAX</td></tr>
+          <tr><td class="k">国内厂商自研</td><td>阿里、华为、百度等</td><td>RTP-LLM（阿里）、MindIE（华为昇腾）、FastDeploy（百度飞桨）等，通常针对自家硬件和模型</td></tr>
+          <tr><td class="k"><a href="https://github.com/triton-inference-server/server">Triton Inference Server</a></td><td>NVIDIA</td><td>通用模型服务器（多框架、ensemble），LLM 场景下作为 TRT-LLM 的前端；现归入 Dynamo 品牌（Dynamo-Triton）</td></tr>
+        </tbody>
+      </table></div>
+    </section>

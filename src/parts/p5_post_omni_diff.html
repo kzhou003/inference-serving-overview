@@ -1,0 +1,262 @@
+
+    <section id="posttrain">
+      <h2><span class="no">08</span>后训练里的推理：RL rollout 是一个推理问题</h2>
+      <p>推理引擎不只用来服务用户，后训练的很多环节本质上都是大批量推理：</p>
+      <ul class="facts">
+        <li><b>在线 RL</b>（PPO、GRPO、DAPO 等）：每一步都要用当前策略为每个 prompt 生成多条回答（GRPO 常见 8–64 条），推理模型的回答动辄上万 token。</li>
+        <li><b>数据合成与蒸馏</b>：用强模型批量生成 SFT 数据；rejection sampling / best-of-N 挑选高分样本。</li>
+        <li><b>打分</b>：reward model、LLM-as-judge 也是推理负载。</li>
+        <li><b>训练中的评测</b>：每隔若干步在基准上跑一遍。</li>
+      </ul>
+      <figure class="figure" id="fig-rl"><div class="fig-body"></div>
+        <figcaption><b>RL 训练闭环。</b>rollout 引擎（vLLM / SGLang）生成回答，agentic 任务还要和 sandbox 中的工具 / 环境多轮交互；verifier 或 reward model 打分；训练引擎（FSDP / Megatron）更新参数；新权重同步回 rollout 引擎，进入下一步。紫色虚线是权重同步，它每一步都要发生。</figcaption>
+      </figure>
+      <script>
+      flow("fig-rl", { w: 980, h: 330, label: "RL 训练闭环", nodes: [
+        { id: "pr", x: 80, y: 80, t: "Prompt 数据集", s: "数学 · 代码 · agent 任务", w: 160 },
+        { id: "ro", x: 320, y: 80, t: "Rollout 引擎", s: "vLLM / SGLang\n每 prompt n 条采样", k: "acc", w: 180 },
+        { id: "env", x: 150, y: 240, t: "环境 / 工具 / Sandbox", s: "代码执行 · 浏览器\nSWE 仓库容器", k: "teal", w: 190 },
+        { id: "rw", x: 580, y: 80, t: "Reward", s: "规则 verifier · 单元测试\nRM · LLM judge", k: "warn", w: 190 },
+        { id: "tr", x: 840, y: 80, t: "训练引擎", s: "FSDP / Megatron\n优势估计 · 更新", k: "pass", w: 170 },
+        { id: "ws", x: 700, y: 230, t: "权重同步", s: "CUDA IPC · NCCL 广播\nresharding TP 布局", k: "vio", w: 190 }
+      ], edges: [
+        { f: "pr", t: "ro", k: "acc" }, { f: "ro", t: "env", k: "teal", both: true, l: "多轮 tool call", fs: "b", ts: "r" }, { f: "ro", t: "rw", k: "warn", l: "轨迹" },
+        { f: "rw", t: "tr", k: "pass", l: "奖励 / 优势" }, { f: "tr", t: "ws", k: "vio", fs: "b", ts: "r" }, { f: "ws", t: "ro", k: "vio", d: true, a: true, fs: "l", ts: "b", st: true, fo: 0, to: 50, l: "新策略" }
+      ]});
+      </script>
+
+      <h3>后训练：模型特征 → 场景 → 推理负载</h3>
+      <div class="table-box"><table class="chain">
+        <thead><tr><th>模型特征</th><th>为什么这样设计（场景决定）</th><th>在推理负载上的体现</th></tr></thead>
+        <tbody><tr><td>推理模型输出长 CoT（几千到几万 token）</td><td>用可验证奖励训练推理能力，思考越充分越可能答对</td><td>rollout 极度 decode-heavy；长度长尾 → step 时间由最长样本决定</td></tr><tr><td>GRPO 类组采样：每 prompt 采 n 条</td><td>用组内相对奖励代替 critic 估计优势</td><td>n 条共享整段 prompt → 前缀 cache 命中极高；批很大，吞吐优先</td></tr><tr><td>策略每一步都更新</td><td>on-policy 学习</td><td>权重高频同步；推理引擎要能热更新、释放 / 收回显存</td></tr><tr><td>多轮工具使用（agentic）</td><td>训练 agent 在真实环境里完成任务</td><td>环境步骤与 sandbox 成为关键路径；多轮 KV 复用；异步调度</td></tr><tr><td>MoE 策略 + FP8 rollout</td><td>前沿模型规模与成本</td><td>训练与推理的路由、数值不一致 → off-policy 修正、路由回放、确定性 kernel</td></tr></tbody>
+      </table></div>
+      <h3>和在线服务相比，rollout 有什么不同</h3>
+      <div class="table-box"><table>
+        <thead><tr><th>维度</th><th>在线服务</th><th>RL rollout</th></tr></thead>
+        <tbody>
+          <tr><td class="k">目标</td><td>满足每个请求的 SLO</td><td>一个训练 step 的总时间最短（看最慢的那条）</td></tr>
+          <tr><td class="k">权重</td><td>长期不变</td><td>每一步都更新，需要快速同步</td></tr>
+          <tr><td class="k">数值</td><td>输出合理即可</td><td>logprob 要和训练引擎一致，否则变成 off-policy</td></tr>
+          <tr><td class="k">长度分布</td><td>大多较短</td><td>长尾极重：少数回答长达几万 token</td></tr>
+          <tr><td class="k">前缀共享</td><td>系统 prompt</td><td>同一 prompt 的 n 条采样共享整段 prompt（前缀 cache 收益大）</td></tr>
+          <tr><td class="k">显存</td><td>独占 GPU</td><td>常与训练共用 GPU（colocate），要能快速让出 / 收回显存</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>四个核心难题</h3>
+      <h4>1. 权重同步</h4>
+      <ul class="facts">
+        <li><b>Colocated（共置）：</b>训练和推理分时共用同一批 GPU。训练时推理引擎“睡眠”（vLLM sleep mode / SGLang <code>release_memory_occupation</code> 释放 KV 和权重显存），推理时把训练状态 offload。权重通过 CUDA IPC 句柄零拷贝传给推理引擎，并从 FSDP / Megatron 的切分方式 reshard 成推理的 TP 布局。verl 的 HybridEngine 是代表。</li>
+        <li><b>Disaggregated（分离）：</b>训练和推理各用一组 GPU，权重通过 NCCL / RDMA 广播。资源利用更灵活，适合异步 RL；超大模型要优化传输（例如 Moonshot 开源的 checkpoint-engine 用于万亿参数模型的快速权重更新）。</li>
+      </ul>
+      <h4>2. 长尾（straggler）</h4>
+      <p>同步 RL 里，一个 step 必须等最长的回答生成完，其他 GPU 空转。</p>
+      <figure class="figure" id="fig-rltail"><div class="fig-body"></div>
+        <figcaption><b>同步 vs 异步。</b>上：同步 RL，rollout 引擎大部分时间在等两条超长回答，训练也只能等。下：异步 RL，rollout 持续生成并把完成的样本流式交给训练，训练用“落后一两个版本”的数据，引擎在 step 之间更新权重。</figcaption>
+      </figure>
+      <script>
+      gantt("fig-rltail", { w: 920, max: 40, labelW: 150, rowH: 22, top: 18, rows: ["同步 · 回答 1–6", "回答 7", "回答 8", "训练", "", "异步 · rollout", "训练"], ticks: 5, tickLabels: false, axis: "时间 →", bars: [
+        { r: 0, s: 0, e: 6, t: "多数回答较短", k: "acc" }, { r: 0, s: 6, e: 18, t: "空闲", k: "m" },
+        { r: 1, s: 0, e: 12, t: "长回答", k: "acc" }, { r: 1, s: 12, e: 18, t: "空闲", k: "m" }, { r: 2, s: 0, e: 18, t: "超长回答（长尾）", k: "warn" },
+        { r: 3, s: 0, e: 18, t: "等待 rollout", k: "m" }, { r: 3, s: 18, e: 24, t: "update", k: "pass" }, { r: 0, s: 24, e: 30, t: "下一步…", k: "acc" },
+        { r: 5, s: 0, e: 8, t: "v0 生成", k: "acc" }, { r: 5, s: 8, e: 16, t: "v0/v1 生成", k: "acc" }, { r: 5, s: 16, e: 24, t: "v1/v2 生成", k: "acc" }, { r: 5, s: 24, e: 32, t: "…", k: "acc" },
+        { r: 6, s: 8, e: 14, t: "update→v1", k: "pass" }, { r: 6, s: 16, e: 22, t: "update→v2", k: "pass" }, { r: 6, s: 24, e: 30, t: "update→v3", k: "pass" }
+      ]});
+      </script>
+      <ul class="facts">
+        <li><b>Partial rollout</b>（Kimi k1.5）：超长回答先截断，下一轮接着生成。</li>
+        <li><b>异步 / off-policy</b>：AReaL（全异步 + staleness 控制）、verl / slime 的 one-step off-policy、PipelineRL（生成中途更新权重）。</li>
+        <li><b>动态采样 / 过采样</b>：DAPO 丢掉奖励全相同（无梯度信号）的组，多发一些 prompt 来凑满批。</li>
+      </ul>
+      <h4>3. 训练–推理不一致（training–inference mismatch）</h4>
+      <p>推理引擎算出的 token 概率和训练引擎对同一序列重算的概率不完全一样：kernel 不同、批大小不同导致的归约顺序不同、rollout 用 FP8 而训练用 BF16、MoE 的路由在两边选了不同专家。结果是“名义上的 on-policy 实际上是 off-policy”，会导致训练不稳定甚至崩溃。</p>
+      <ul class="facts">
+        <li><b>训练侧重算 logprob</b>，并用重要性采样修正（如截断重要性采样 TIS）。</li>
+        <li><b>MoE 路由回放</b>：记录 rollout 时每个 token 用了哪些专家，训练时强制用相同路由。</li>
+        <li><b>确定性 / 批不变（batch-invariant）kernel</b>：Thinking Machines 2025 年的文章《Defeating Nondeterminism in LLM Inference》指出非确定性主要来自 kernel 的归约顺序随批大小变化，而不是常说的“GPU 并发”；之后 vLLM 和 SGLang 都加入了确定性推理模式（会损失一些性能）。</li>
+      </ul>
+      <h4>4. Agentic RL 的多轮交互</h4>
+      <ul class="facts">
+        <li>一条轨迹包含多次“生成 → 调工具 → 拿结果 → 再生成”，环境步骤（跑单元测试、编译、浏览网页）可能比生成还慢，需要异步调度，否则 GPU 空等。</li>
+        <li>需要大量并发 sandbox（几千个隔离的容器 / microVM），见 <a href="#adjacent">14</a>。</li>
+        <li>多轮之间要复用 KV（会话粘性、前缀 cache）；尽量 “token in, token out”，避免每轮把文本重新 tokenize 带来的 token 序列漂移。</li>
+      </ul>
+
+      <h3>RL 框架与它们用的推理引擎</h3>
+      <div class="srcs"><span class="srcs-label">源码</span>{{s:volcengine/verl:verl/workers/rollout|verl rollout/}}{{s:volcengine/verl:verl/checkpoint_engine|verl checkpoint_engine}}{{s:THUDM/slime:slime/backends|slime backends/}}{{s:inclusionAI/AReaL:areal|AReaL areal/}}{{s:huggingface/trl:trl/generation/vllm_client.py|TRL vllm_client.py}}{{r:OpenRLHF/OpenRLHF|OpenRLHF}}{{s:sgl-project/sglang:python/sglang/srt/weight_sync|SGLang weight_sync/}}{{s:vllm-project/vllm:docs/features/sleep_mode.md|vLLM sleep mode}}{{w:volcengine/verl|verl · Code Wiki}}</div>
+      <div class="table-box"><table>
+        <thead><tr><th>框架</th><th>来源</th><th>训练后端</th><th>Rollout 引擎</th><th>特点</th></tr></thead>
+        <tbody>
+          <tr><td class="k"><a href="https://github.com/volcengine/verl">verl</a></td><td>字节 Seed（HybridFlow 论文）</td><td>FSDP / Megatron</td><td>vLLM / SGLang</td><td>单控制器 + 多控制器混合编程模型；共置 HybridEngine；生态最大。另有基于 vLLM-Omni 的 VeRL-Omni，支持多模态 / 扩散模型的 RL</td></tr>
+          <tr><td class="k"><a href="https://github.com/OpenRLHF/OpenRLHF">OpenRLHF</a></td><td>社区</td><td>DeepSpeed</td><td>vLLM</td><td>基于 Ray，分离式部署</td></tr>
+          <tr><td class="k"><a href="https://github.com/huggingface/trl">TRL</a></td><td>Hugging Face</td><td>Transformers / Accelerate</td><td>vLLM（colocate 或 server 模式）</td><td>易用，GRPOTrainer 等</td></tr>
+          <tr><td class="k"><a href="https://github.com/THUDM/slime">slime</a></td><td>清华 / 智谱</td><td>Megatron</td><td>SGLang</td><td>GLM-4.5 系列的 RL 框架；同步 / 异步模式</td></tr>
+          <tr><td class="k">Miles</td><td>RadixArk</td><td>Megatron 等</td><td>SGLang</td><td>面向大规模 MoE 的企业级 RL 框架</td></tr>
+          <tr><td class="k"><a href="https://github.com/inclusionAI/AReaL">AReaL</a></td><td>蚂蚁 / 清华</td><td>FSDP / Megatron</td><td>SGLang / vLLM</td><td>全异步 RL，生成与训练完全解耦</td></tr>
+          <tr><td class="k"><a href="https://github.com/alibaba/ROLL">ROLL</a></td><td>阿里</td><td>Megatron / FSDP</td><td>vLLM / SGLang</td><td>大规模、agentic 场景</td></tr>
+          <tr><td class="k"><a href="https://github.com/NVIDIA-NeMo/RL">NeMo-RL</a></td><td>NVIDIA</td><td>Megatron / DTensor</td><td>vLLM</td><td>NVIDIA 生态</td></tr>
+          <tr><td class="k"><a href="https://github.com/NovaSky-AI/SkyRL">SkyRL</a> / <a href="https://github.com/PrimeIntellect-ai/prime-rl">prime-rl</a></td><td>Berkeley NovaSky / Prime Intellect</td><td>FSDP 等</td><td>vLLM / SGLang</td><td>长程 agent 任务 / 去中心化异步训练</td></tr>
+        </tbody>
+      </table></div>
+      <p>商业形态：Thinking Machines 的 Tinker 把“训练 + 采样”做成 API；各家推理平台也提供微调 + 托管一体的服务。</p>
+    </section>
+
+    <section id="omni">
+      <h2><span class="no">09</span>Omni / 语音 / 多模态模型的推理服务</h2>
+      <p>多模态分两类：<b>多模态输入</b>（VLM，图像 / 视频 / 音频 → 文本），基本可以沿用 LLM serving，只多一个 encoder；<b>多模态输出</b>（文本 + 语音、图像生成、any-to-any），模型由多个异构组件串起来，serving 的假设被根本改变。</p>
+      <h3>代表模型的结构：Thinker–Talker</h3>
+      <p>以 Qwen3-Omni 为例：音频 encoder（AuT）和视觉 encoder（SigLIP2）把输入编码后交给 <b>Thinker</b>（30B 总参数 / 3B 激活的 MoE LLM）生成文本；Thinker 的隐藏状态再交给 <b>Talker</b>（3B / 0.3B 激活的 MoE，带 MTP 预测多层 codebook）生成音频 codec token；最后 <b>Code2Wav</b>（约 2 亿参数的卷积网络）把 codec token 解码成波形，按块流式输出。类似结构还有 Qwen2.5-Omni、MiniCPM-o、Ming-Omni 等；全双工模型如 Kyutai 的 Moshi 能边听边说。</p>
+      <figure class="figure" id="fig-omni"><div class="fig-body"></div>
+        <figcaption><b>多阶段 omni 流水线（以 Qwen3-Omni 为例）。</b>每个阶段的计算特征完全不同：encoder 是非自回归的大算子，Thinker 是标准 LLM decode，Talker 是小模型高频 decode，Code2Wav 是卷积解码。阶段之间按块（chunk）异步交接，让第一段音频尽早出来。</figcaption>
+      </figure>
+      <script>
+      flow("fig-omni", { w: 980, h: 330, label: "Omni 多阶段流水线", nodes: [
+        { id: "in", x: 75, y: 160, t: "输入", s: "音频 · 图像\n视频 · 文本", w: 110 },
+        { id: "ae", x: 240, y: 90, t: "音频 encoder", s: "AuT", k: "teal", w: 130 },
+        { id: "ve", x: 240, y: 230, t: "视觉 encoder", s: "SigLIP2 · 视频抽帧", k: "teal", w: 150 },
+        { id: "th", x: 440, y: 160, t: "Thinker", s: "MoE LLM 30B-A3B\nKV cache · 连续批", k: "acc", w: 170 },
+        { id: "tk", x: 690, y: 160, t: "Talker", s: "MoE 3B-A0.3B\n+ MTP 多 codebook", k: "vio", w: 170 },
+        { id: "cw", x: 895, y: 160, t: "Code2Wav", s: "卷积解码\n按块输出波形", k: "warn", w: 140 },
+        { id: "txt", x: 440, y: 290, t: "文本流", s: "SSE", k: "acc", w: 110 },
+        { id: "aud", x: 895, y: 290, t: "音频流", s: "PCM / Opus 块", k: "warn", w: 130 }
+      ], edges: [
+        { f: "in", t: "ae", k: "teal" }, { f: "in", t: "ve", k: "teal" }, { f: "ae", t: "th", k: "teal", l: "embedding" }, { f: "ve", t: "th", k: "teal" },
+        { f: "th", t: "tk", k: "vio", a: true, l: "按块交接" }, { f: "tk", t: "cw", k: "warn", a: true, l: "codec 块" },
+        { f: "th", t: "txt", k: "acc" }, { f: "cw", t: "aud", k: "warn" }
+      ], groups: [{ x: 160, y: 22, w: 175, h: 265, t: "Encode 阶段", k: "teal" }]});
+      </script>
+
+      <h3>Omni / 语音：模型特征 → 场景 → 推理负载</h3>
+      <div class="table-box"><table class="chain">
+        <thead><tr><th>模型特征</th><th>为什么这样设计（场景决定）</th><th>在推理负载上的体现</th></tr></thead>
+        <tbody><tr><td>统一的多模态输入（音频 / 视觉 encoder）</td><td>一个模型理解所有模态</td><td>encoder 是非自回归的大算子；一张图几百到几千个视觉 token → prefill 变长；encoder 输出可缓存，或拆成独立 encode 池（EPD）</td></tr><tr><td>Thinker–Talker 分离</td><td>文本推理和语音生成需要不同规模的模型，解耦后各自最优</td><td>一个请求跨多个异构阶段，每个阶段的批大小与资源不同；阶段间要传隐藏状态</td></tr><tr><td>离散音频 codec：多 codebook（RVQ），每秒十几到几十帧</td><td>用语言模型的方式生成音频</td><td>每秒音频需要几十次 Talker decode × 多个 codebook → 小模型、超高频 decode，launch 开销占比高，需要 CUDA graph / MTP 一次预测多层</td></tr><tr><td>因果、可流式的 codec 解码器</td><td>实时对话</td><td>chunk 级流水；首包延迟（TTFP）和 RTF &lt; 1 成为硬约束</td></tr><tr><td>全双工（边听边说）</td><td>自然的对话体验、可打断</td><td>持久会话 + 固定节拍推进 + 打断时取消；调度从“吞吐优先”变成“实时优先”</td></tr></tbody>
+      </table></div>
+      <h3>相对 LLM serving，哪些假设变了</h3>
+      <div class="table-box"><table>
+        <thead><tr><th>变化</th><th>带来的问题</th><th>做法</th></tr></thead>
+        <tbody>
+          <tr><td class="k">一个模型 = 多个异构阶段</td><td>不同阶段的最优批大小、并行方式、显存需求不同；一个阶段慢会拖住整条流水线</td><td><b>阶段化运行时</b>：每个阶段有自己的调度器和执行器（AR 阶段复用 vLLM / SGLang 引擎，非 AR 阶段用轻量调度），阶段可以共置或放到不同 GPU，按负载分配资源</td></tr>
+          <tr><td class="k">阶段间要传张量</td><td>隐藏状态、codec token、embedding 在进程 / GPU / 机器之间流动</td><td>传输层抽象：共享内存、NCCL、NIXL、Mooncake（vLLM-Omni 的 OmniConnector；SGLang-Omni 的 relay 数据面）</td></tr>
+          <tr><td class="k">输出是实时流</td><td>用户关心第一段音频多快出来，以及之后会不会断（播放 underrun）</td><td>阶段间 <b>chunk 级异步交接</b>：Talker 不等 Thinker 说完；Code2Wav 每凑够一块 codec token 就解码（带左上下文重叠避免接缝）</td></tr>
+          <tr><td class="k">多模态预处理重</td><td>图像 / 视频解码和缩放在 CPU 上；一张图几百到几千个视觉 token</td><td>预处理多进程化、encoder 输出缓存（同一张图多轮复用）、前缀 cache 把多模态内容哈希进 key、<b>EPD 分离</b>（encoder 单独成池）</td></tr>
+          <tr><td class="k">全双工实时交互</td><td>模型边听边说；用户随时打断；每个会话要按固定节拍（如每 80 ms）推进</td><td>持久会话（会话状态常驻 GPU）、WebSocket / WebRTC 实时 API、VAD 与轮次管理、打断时取消生成并回收 KV；调度更像实时系统</td></tr>
+          <tr><td class="k">TTS 特有结构</td><td>多 codebook（RVQ）、参考音频声音克隆</td><td>delay pattern / depth transformer、小模型 decode 用 CUDA graph、说话人 embedding 缓存</td></tr>
+        </tbody>
+      </table></div>
+      <figure class="figure" id="fig-omnistream"><div class="fig-body"></div>
+        <figcaption><b>流式重叠。</b>Thinker 还在生成文本时，Talker 已经开始处理第一块；Code2Wav 解码出第一块音频后客户端立即播放。首包延迟（TTFP）由“第一块”路径决定，而不是整句；之后只要每块的生成速度快于播放速度（RTF &lt; 1），播放就不会断。</figcaption>
+      </figure>
+      <script>
+      gantt("fig-omnistream", { w: 920, max: 40, labelW: 130, rowH: 26, top: 26, rows: ["Thinker", "Talker", "Code2Wav", "客户端播放"], ticks: 5, tickLabels: false, axis: "时间 →", bars: [
+        { r: 0, s: 0, e: 5, t: "prefill", k: "acc" }, { r: 0, s: 5, e: 10, t: "文本块1", k: "acc" }, { r: 0, s: 10, e: 15, t: "文本块2", k: "acc" }, { r: 0, s: 15, e: 20, t: "文本块3", k: "acc" },
+        { r: 1, s: 10, e: 15, t: "codec 块1", k: "vio" }, { r: 1, s: 15, e: 20, t: "codec 块2", k: "vio" }, { r: 1, s: 20, e: 25, t: "codec 块3", k: "vio" },
+        { r: 2, s: 15, e: 17, t: "wav1", k: "warn" }, { r: 2, s: 20, e: 22, t: "wav2", k: "warn" }, { r: 2, s: 25, e: 27, t: "wav3", k: "warn" },
+        { r: 3, s: 17, e: 24, t: "播放块1", k: "passs" }, { r: 3, s: 24, e: 31, t: "播放块2", k: "passs" }, { r: 3, s: 31, e: 38, t: "播放块3", k: "passs" }
+      ], marks: [{ x: 17, t: "TTFP（首包）", k: "pass" }]});
+      </script>
+
+      <h3>级联 vs 端到端</h3>
+      <div class="two">
+        <div class="card"><h4>级联：ASR → LLM → TTS</h4><p>模块成熟、可替换、易调试；延迟是三段相加（每段都要流式才能压下来）；语气、情绪等副语言信息在 ASR 处丢失。框架：Pipecat、LiveKit Agents 负责 VAD、轮次、打断和 WebRTC 传输。</p></div>
+        <div class="card vio"><h4>端到端 omni / 全双工</h4><p>延迟更低、能保留副语言信息、能边听边说；但服务端复杂（多阶段、持久会话、实时节拍），评测也更难。代表：GPT-4o / Realtime API、Gemini Live、Qwen-Omni、MiniCPM-o、Moshi。</p></div>
+      </div>
+
+      <h3>指标</h3>
+      <p>TTFT（文本首 token）、<b>TTFP / TTFA</b>（首个音频包）、TPOT、<b>RTF</b>（生成耗时 ÷ 音频时长，&lt; 1 才能实时）、播放 underrun；质量上用 ASR 转写生成语音算 WER（可懂度）、说话人相似度（SIM）、UTMOS（自然度）；ASR 服务看 WER 和 RTFx（每秒处理多少秒音频）。</p>
+
+      <h3>框架</h3>
+      <div class="table-box"><table>
+        <thead><tr><th>项目</th><th>定位</th></tr></thead>
+        <tbody>
+          <tr><td class="k"><a href="https://github.com/vllm-project/vllm-omni">vLLM-Omni</a></td><td>vLLM 官方项目（2025-11 发布），阶段化流水线，AR + DiT 混合，OmniConnector 全解耦，覆盖 omni、TTS、扩散、机器人策略模型，支持全双工实时</td></tr>
+          <tr><td class="k"><a href="https://github.com/sgl-project/sglang-omni">SGLang-Omni</a></td><td>SGLang 生态的多阶段语音 / omni 运行时：阶段专属调度、relay 数据面（shm / NCCL / NIXL / Mooncake）、全双工与级联语音助手、ASR / TTS / 说话人分离</td></tr>
+          <tr><td class="k">vLLM / SGLang / LMDeploy 原生 VLM</td><td>图像 / 视频 / 音频输入 → 文本，encoder 缓存、多模态前缀 cache</td></tr>
+          <tr><td class="k">NVIDIA Riva / NeMo、faster-whisper、whisper.cpp</td><td>ASR / TTS 专用推理</td></tr>
+          <tr><td class="k"><a href="https://github.com/pipecat-ai/pipecat">Pipecat</a>、<a href="https://github.com/livekit/agents">LiveKit Agents</a></td><td>语音 agent 编排层：VAD、轮次、打断、WebRTC，后端接各种 ASR / LLM / TTS</td></tr>
+        </tbody>
+      </table></div>
+      <div class="srcs"><span class="srcs-label">源码</span>{{s:vllm-project/vllm-omni:vllm_omni/engine|vLLM-Omni engine/}}{{s:vllm-project/vllm-omni:vllm_omni/distributed/omni_connectors|OmniConnector}}{{s:vllm-project/vllm-omni:vllm_omni/core|core/}}{{s:vllm-project/vllm-omni:docs/design/architecture_overview.md|架构文档}}{{s:sgl-project/sglang-omni:sglang_omni/pipeline|SGLang-Omni pipeline/}}{{s:sgl-project/sglang-omni:sglang_omni/comm/stage_io.py|stage_io.py}}{{s:sgl-project/sglang-omni:sglang_omni/comm/kv_transfer.py|kv_transfer.py}}{{s:sgl-project/sglang-omni:sglang_omni/models|models/}}{{w:vllm-project/vllm-omni|vLLM-Omni · Code Wiki}}{{w:sgl-project/sglang-omni|SGLang-Omni · Code Wiki}}</div>
+    </section>
+
+    <section id="diffusion">
+      <h2><span class="no">10</span>扩散模型推理</h2>
+      <p>图像 / 视频 / 音频扩散模型（DiT 为主，如 FLUX、SD3、Qwen-Image、Wan、HunyuanVideo）的推理和 LLM 几乎是镜像关系：</p>
+      <div class="table-box"><table>
+        <thead><tr><th>维度</th><th>LLM decode</th><th>扩散</th></tr></thead>
+        <tbody>
+          <tr><td class="k">迭代方式</td><td>每步生成 1 个 token，步数 = 输出长度（未知）</td><td>每步对<b>全部</b>潜变量去噪，步数固定（常见 20–50，蒸馏后 1–8）</td></tr>
+          <tr><td class="k">瓶颈</td><td>显存带宽</td><td><b>算力</b>（大 GEMM + 超长序列的 attention）</td></tr>
+          <tr><td class="k">状态</td><td>KV cache 随长度增长</td><td>无 KV（双向注意力）；步与步之间特征相似，可做特征缓存</td></tr>
+          <tr><td class="k">序列长度</td><td>上下文 token</td><td>视频极长：Wan 720p、81 帧经 VAE（时间 4×、空间 8×）和 2×2 patch 后为 21×45×80 = 75,600 个 token</td></tr>
+          <tr><td class="k">延迟</td><td>毫秒级 / token</td><td>图像数秒，视频数十秒到数分钟</td></tr>
+          <tr><td class="k">批处理收益</td><td>巨大</td><td>有限（单请求已经 compute-bound），主要用于小图</td></tr>
+          <tr><td class="k">额外开销</td><td>—</td><td>CFG 让每步算两遍（有条件 + 无条件）；视频 VAE 解码显存极大</td></tr>
+        </tbody>
+      </table></div>
+      <figure class="figure" id="fig-diff"><div class="fig-body"></div>
+        <figcaption><b>扩散推理流水线。</b>文本 encoder 只跑一次；去噪循环跑 N 步，每步（使用 CFG 时）算有条件和无条件两次 DiT；特征缓存会在相邻步变化小时跳过部分 block；最后 VAE 把潜变量解码成像素。每个环节旁边标了对应的加速手段。</figcaption>
+      </figure>
+      <script>
+      flow("fig-diff", { w: 980, h: 330, label: "扩散推理流水线", nodes: [
+        { id: "p", x: 70, y: 150, t: "Prompt", s: "+ 参考图", w: 110 },
+        { id: "te", x: 220, y: 150, t: "文本 encoder", s: "T5 · CLIP · Qwen-VL", k: "teal", w: 160 },
+        { id: "noise", x: 220, y: 270, t: "初始噪声 x_T", s: "latent 形状", w: 140 },
+        { id: "dc", x: 450, y: 100, t: "DiT（有条件）", s: "序列并行 · FP8\n稀疏 attention", k: "acc", w: 170 },
+        { id: "du", x: 450, y: 210, t: "DiT（无条件）", s: "CFG 并行到另一卡", k: "acc", w: 170 },
+        { id: "cfg", x: 650, y: 155, t: "CFG 合成", s: "ε = ε_u + w(ε_c − ε_u)", k: "warn", w: 180 },
+        { id: "st", x: 650, y: 270, t: "Scheduler step", s: "x_t → x_{t−1}", k: "warn", w: 150 },
+        { id: "vae", x: 880, y: 155, t: "VAE 解码", s: "分块 · VAE 并行", k: "vio", w: 150 },
+        { id: "out", x: 880, y: 270, t: "图像 / 视频", w: 130 }
+      ], edges: [
+        { f: "p", t: "te", k: "teal" }, { f: "te", t: "dc", k: "teal", l: "条件" }, { f: "noise", t: "dc", k: "acc", fs: "r", ts: "l" }, { f: "noise", t: "du", k: "acc" },
+        { f: "dc", t: "cfg", k: "acc" }, { f: "du", t: "cfg", k: "acc" }, { f: "cfg", t: "st", k: "warn" },
+        { f: "st", t: "du", k: "warn", a: true, l: "循环 N 步", fs: "l", ts: "b" }, { f: "st", t: "vae", k: "vio", d: true, fs: "r", ts: "l", l: "最后一步" }, { f: "vae", t: "out", k: "vio" }
+      ], groups: [{ x: 350, y: 45, w: 410, h: 270, t: "去噪循环 × N（特征缓存可跳过部分 block / 整步）", k: "acc" }]});
+      </script>
+
+      <h3>扩散：模型特征 → 场景 → 推理负载</h3>
+      <div class="table-box"><table class="chain">
+        <thead><tr><th>模型特征</th><th>为什么这样设计（场景决定）</th><th>在推理负载上的体现</th></tr></thead>
+        <tbody><tr><td>双向注意力的 DiT，作用于整个潜变量</td><td>图像 / 视频需要全局一致的结构，所有位置互相可见</td><td>没有 KV cache，每一步都是对全部 token 的“prefill” → compute-bound；单请求就能吃满 GPU，批处理收益有限</td></tr><tr><td>迭代去噪 N 步（扩散 / flow matching）</td><td>从噪声逐步细化，质量与多样性好</td><td>延迟 = N × 单步；相邻步特征相似 → 特征缓存；蒸馏把 N 降到个位数</td></tr><tr><td>Classifier-free guidance</td><td>提高与 prompt 的对齐程度</td><td>每步算两遍（有 / 无条件）→ CFG 并行，或 guidance 蒸馏去掉无条件分支</td></tr><tr><td>高压缩比时空 VAE（8×8 空间、4× 时间）</td><td>把像素降到可训练的 token 数</td><td>视频仍有数万 token → 序列并行（Ulysses / Ring）与稀疏注意力；VAE 解码本身是显存峰值</td></tr><tr><td>大文本编码器（T5-XXL、VLM）</td><td>理解长而复杂的 prompt</td><td>额外数 GB 到数十 GB 显存；只跑一次，可单独部署或 offload</td></tr></tbody>
+      </table></div>
+      <h3>扩散推理的加速技术</h3>
+      <div class="table-box"><table>
+        <thead><tr><th>类别</th><th>方法</th><th>说明</th></tr></thead>
+        <tbody>
+          <tr><td class="k">减少步数</td><td>更好的采样器；蒸馏：LCM / 一致性模型、ADD（SDXL-Turbo）、DMD / DMD2、FLUX.1-schnell 的少步模型</td><td>收益最大（50 步 → 4 步），但需要训练，可能损失多样性</td></tr>
+          <tr><td class="k">特征缓存（免训练）</td><td>DeepCache、FORA、Δ-DiT、TeaCache、First-Block Cache、TaylorSeer；库：Cache-DiT</td><td>相邻步的中间特征很相似，按阈值复用上一步的 block 输出或残差；常见 1.5–2× 加速、轻微质量损失</td></tr>
+          <tr><td class="k">序列并行</td><td>DeepSpeed-Ulysses（all-to-all 换 head）、Ring Attention、两者组合的 USP（xDiT）</td><td>视频生成的主力并行方式，attention 占主导时近线性加速</td></tr>
+          <tr><td class="k">其他并行</td><td>CFG 并行（有 / 无条件放两张卡）、PipeFusion（patch 级流水，利用相邻步激活的相似性）、DistriFusion（patch 并行 + 异步过期激活）、TP、VAE 并行</td><td>按模型规模和分辨率组合</td></tr>
+          <tr><td class="k">注意力</td><td>FlashAttention-3、SageAttention（INT8 / FP8 量化 attention）；视频稀疏注意力：Sliding Tile Attention、Sparse VideoGen、Radial Attention</td><td>长视频序列下 attention 占 70%+ 时间，稀疏化收益大</td></tr>
+          <tr><td class="k">量化</td><td>FP8 DiT、SVDQuant / Nunchaku（W4A4 + 低秩分支吸收离群值）、NVFP4</td><td>同时省显存和算力</td></tr>
+          <tr><td class="k">编译</td><td>torch.compile、TensorRT、CUDA graph；融合 adaLN 调制、norm</td><td>小分辨率时 CPU 开销显著</td></tr>
+          <tr><td class="k">显存</td><td>按层 CPU offload、VAE 分块 / 分片解码</td><td>让 14B–20B 模型跑在消费级显卡上</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>扩散的 serving 系统设计</h3>
+      <ul class="facts">
+        <li><b>异步任务 API</b>：生成要数十秒，通常是“提交 → 轮询 / webhook / 流式进度”，而非长连接等待。</li>
+        <li><b>请求级 vs 步级批处理</b>：每一步跑的是同一个网络，不同请求处在不同步也能拼批（step-level continuous batching）；要求分辨率 / 帧数相同或做分桶。vLLM-Omni 等已实现扩散的连续批处理。</li>
+        <li><b>LoRA 热切换</b>：图像平台上用户大量使用风格 LoRA，需要快速加载与融合。</li>
+        <li><b>流水线解耦</b>：文本 encoder、DiT、VAE 可以放不同 GPU / 不同批大小（AR + DiT 混合模型更需要，如 HunyuanImage-3、BAGEL）。</li>
+        <li><b>与 LLM 技术融合</b>：自回归视频扩散（CausVid、Self-Forcing）按帧块生成并缓存 KV，能实时流式出视频；交互式世界模型（如 Genie 3、Cosmos 类）把扩散推理变成了“流式 + KV cache + 低延迟”的问题。扩散语言模型（LLaDA、Mercury、Gemini Diffusion）则把并行去噪带到了文本生成。</li>
+      </ul>
+      <p><b>指标：</b>单图 / 单视频端到端延迟、每秒步数（it/s）、吞吐（images/s）、峰值显存；流式视频看首帧时间；质量看 FID、CLIP score、GenEval、VBench 与人类偏好分。</p>
+
+      <h3>框架</h3>
+      <div class="table-box"><table>
+        <thead><tr><th>项目</th><th>定位</th></tr></thead>
+        <tbody>
+          <tr><td class="k"><a href="https://github.com/huggingface/diffusers">Diffusers</a></td><td>参考实现与模型库，几乎所有扩散模型首发支持</td></tr>
+          <tr><td class="k"><a href="https://github.com/comfyanonymous/ComfyUI">ComfyUI</a></td><td>节点式工作流，创作者生态核心，常被包装成 API 服务</td></tr>
+          <tr><td class="k"><a href="https://github.com/xdit-project/xDiT">xDiT</a></td><td>DiT 并行推理引擎：USP、PipeFusion、CFG 并行</td></tr>
+          <tr><td class="k"><a href="https://github.com/hao-ai-lab/FastVideo">FastVideo</a></td><td>视频生成加速：Sliding Tile Attention、蒸馏、序列并行</td></tr>
+          <tr><td class="k"><a href="https://github.com/ModelTC/LightX2V">LightX2V</a></td><td>视频生成推理框架：量化、缓存、步数蒸馏组合</td></tr>
+          <tr><td class="k"><a href="https://github.com/nunchaku-tech/nunchaku">Nunchaku</a> / <a href="https://github.com/vipshop/cache-dit">Cache-DiT</a></td><td>4-bit SVDQuant 推理 / 统一的 DiT 特征缓存库</td></tr>
+          <tr><td class="k">SGLang Diffusion、vLLM-Omni</td><td>把 LLM serving 的工程能力（OpenAI 兼容 API、批处理、并行、量化）带到图像 / 视频生成</td></tr>
+          <tr><td class="k">TensorRT / ModelOpt</td><td>NVIDIA 的编译与量化路径</td></tr>
+        </tbody>
+      </table></div>
+      <div class="srcs"><span class="srcs-label">源码</span>{{s:huggingface/diffusers:src/diffusers/pipelines|Diffusers pipelines/}}{{s:huggingface/diffusers:src/diffusers/models/transformers|DiT 实现}}{{s:huggingface/diffusers:src/diffusers/hooks|hooks（缓存 / offload）}}{{s:xdit-project/xDiT:xfuser/core|xDiT core/}}{{s:hao-ai-lab/FastVideo:fastvideo/attention|FastVideo attention/}}{{s:vipshop/cache-dit:src/cache_dit/caching|cache-dit caching/}}{{s:nunchaku-tech/nunchaku:nunchaku/csrc|Nunchaku csrc}}{{s:sgl-project/sglang:python/sglang/multimodal_gen/runtime|SGLang Diffusion runtime}}{{s:vllm-project/vllm-omni:vllm_omni/diffusion|vLLM-Omni diffusion/}}{{w:huggingface/diffusers|Diffusers · Code Wiki}}{{w:xdit-project/xDiT|xDiT · Code Wiki}}</div>
+    </section>

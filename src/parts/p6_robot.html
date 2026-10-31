@@ -1,0 +1,91 @@
+
+    <section id="robotics">
+      <h2><span class="no">11</span>机器人推理：从“吞吐”回到“实时”</h2>
+      <p>机器人策略模型（VLA，Vision-Language-Action）在结构上是“VLM + 动作头”，看起来像多模态 LLM，但推理的目标函数完全不同：它运行在一个物理闭环里，<b>延迟和抖动直接决定任务成败与安全</b>，而吞吐几乎无所谓。</p>
+      <h3>代表模型</h3>
+      <div class="table-box"><table>
+        <thead><tr><th>模型</th><th>结构</th><th>推理相关特点</th></tr></thead>
+        <tbody>
+          <tr><td class="k">RT-2（Google DeepMind，2023）</td><td>大 VLM 直接输出离散化动作 token</td><td>模型很大，控制频率只有个位数 Hz，依赖云端</td></tr>
+          <tr><td class="k">OpenVLA（2024）</td><td>7B，Llama-2 骨干，自回归输出动作 token</td><td>每个动作维度一个 token，逐个生成，频率低</td></tr>
+          <tr><td class="k">π0 / π0.5（Physical Intelligence）</td><td>PaliGemma 3B VLM + 约 3 亿参数的 action expert，flow matching</td><td>一次推理输出 50 步的动作块（action chunk），用约 10 步积分生成连续动作，支持 50 Hz 控制</td></tr>
+          <tr><td class="k">GR00T N1 系列（NVIDIA）</td><td>System 2：VLM 理解（约 10 Hz）；System 1：DiT 动作头（flow matching）</td><td>快慢双系统；面向人形机器人，部署到 Jetson Thor</td></tr>
+          <tr><td class="k">Helix（Figure）</td><td>S2：7B VLM，7–9 Hz；S1：约 8000 万参数视觉运动策略，200 Hz</td><td>双系统解耦，S1 用 S2 的最新潜变量</td></tr>
+          <tr><td class="k">Gemini Robotics</td><td>云端大模型骨干 + 机器人本地的动作解码器</td><td>云端负责理解，本地负责高频输出</td></tr>
+          <tr><td class="k">SmolVLA（Hugging Face）</td><td>约 4.5 亿参数的小 VLA</td><td>消费级硬件可跑，配合异步推理</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3>机器人：模型特征 → 场景 → 推理负载</h3>
+      <div class="table-box"><table class="chain">
+        <thead><tr><th>模型特征</th><th>为什么这样设计（场景决定）</th><th>在推理负载上的体现</th></tr></thead>
+        <tbody><tr><td>VLM 骨干 + 动作专家（action expert）</td><td>用互联网规模的视觉语言知识泛化，同时输出精细的连续控制</td><td>每次推理 = 一次图像 + 指令的 prefill + 动作头多步积分；图像每帧都变，前缀几乎无法复用，prefill 主导延迟</td></tr><tr><td>动作块（一次输出 H 步，如 50 步）</td><td>动作更平滑，降低对推理频率的要求</td><td>推理频率可以低于控制频率，但必须异步执行并在块之间平滑衔接（RTC）</td></tr><tr><td>flow matching / 扩散动作头</td><td>动作分布是多峰的（同一场景有多种合理动作）</td><td>积分步数直接计入延迟（π0 约 10 步）；步数与平滑度之间要权衡</td></tr><tr><td>多相机 + 本体感觉输入</td><td>空间理解与精确定位</td><td>每次推理多张图 → 视觉 token 多；传感器数据要低延迟进入 GPU</td></tr><tr><td>快慢双系统（S2 / S1）</td><td>语义理解可以慢，运动控制必须快</td><td>两个模型按不同频率运行、可放在不同硬件上，需要多速率调度</td></tr></tbody>
+      </table></div>
+      <h3>机器人推理 vs LLM serving</h3>
+      <div class="table-box"><table>
+        <thead><tr><th>维度</th><th>LLM serving</th><th>机器人推理</th></tr></thead>
+        <tbody>
+          <tr><td class="k">闭环</td><td>开环：生成完交给用户</td><td>闭环：动作改变世界，下一帧观测依赖上一步动作；推理慢 = 用过期的观测做决策</td></tr>
+          <tr><td class="k">批大小</td><td>越大越好</td><td>每台机器人 batch = 1（机队云端推理时可以跨机器人拼批）</td></tr>
+          <tr><td class="k">关心的统计量</td><td>p50 / p99 延迟、吞吐</td><td><b>最坏情况延迟、抖动</b>、是否错过控制周期</td></tr>
+          <tr><td class="k">硬件</td><td>数据中心 GPU</td><td>机载边缘设备（Jetson Orin / Thor，功耗几十到上百瓦）或经 Wi-Fi / 5G 访问远端 GPU（网络抖动）</td></tr>
+          <tr><td class="k">频率</td><td>按请求</td><td>多速率：VLM 推理 5–10 Hz，动作策略 50–200 Hz，底层关节控制 500 Hz–1 kHz</td></tr>
+          <tr><td class="k">失败代价</td><td>重试即可</td><td>不能重试，可能造成碰撞；需要看门狗、动作限幅、超时回退</td></tr>
+          <tr><td class="k">输入</td><td>文本 / 图片</td><td>多路相机流 + 本体感觉（关节角、力矩），持续不断</td></tr>
+        </tbody>
+      </table></div>
+      <figure class="figure" id="fig-robot"><div class="fig-body"></div>
+        <figcaption><b>多速率控制回路。</b>慢系统（VLM）理解场景和指令，快系统（动作头）输出动作块，放进动作缓冲区；底层控制器以高频从缓冲区取动作驱动电机；安全监控可以随时截断。外环和内环的频率差一到两个数量级。</figcaption>
+      </figure>
+      <script>
+      flow("fig-robot", { w: 980, h: 330, label: "机器人多速率推理回路", nodes: [
+        { id: "cam", x: 80, y: 80, t: "相机 ×N", s: "30–60 Hz", k: "teal", w: 120 },
+        { id: "pro", x: 80, y: 200, t: "本体感觉", s: "关节 · 力矩 500 Hz", k: "teal", w: 140 },
+        { id: "s2", x: 290, y: 80, t: "System 2 · VLM", s: "场景 + 指令理解\n5–10 Hz", k: "acc", w: 170 },
+        { id: "s1", x: 510, y: 140, t: "System 1 · 动作头", s: "flow matching / DiT\n输出 H 步动作块", k: "vio", w: 180 },
+        { id: "buf", x: 720, y: 140, t: "动作缓冲区", s: "chunk 队列\n平滑 / 实时拼接", k: "warn", w: 150 },
+        { id: "ctl", x: 890, y: 230, t: "底层控制器", s: "500 Hz–1 kHz", k: "pass", w: 140 },
+        { id: "env", x: 560, y: 280, t: "机器人 + 环境", s: "执行器 · 物理世界", w: 170 },
+        { id: "safe", x: 890, y: 60, t: "安全监控", s: "限幅 · 看门狗 · 急停", k: "todo", w: 150 }
+      ], edges: [
+        { f: "cam", t: "s2", k: "teal" }, { f: "s2", t: "s1", k: "acc", l: "潜变量", fs: "r", ts: "t" }, { f: "pro", t: "s1", k: "teal" }, { f: "s1", t: "buf", k: "vio", a: true },
+        { f: "buf", t: "ctl", k: "warn" }, { f: "ctl", t: "env", k: "pass", fs: "b", ts: "r", st: true }, { f: "env", t: "cam", k: "m", d: true, fs: "l", ts: "b", st: true, l: "新观测" },
+        { f: "safe", t: "ctl", k: "todo", d: true }
+      ], groups: [{ x: 195, y: 25, w: 425, h: 175, t: "策略推理（GPU）", k: "acc" }]});
+      </script>
+
+      <h3>关键技术</h3>
+      <ul class="facts">
+        <li><b>Action chunking</b>（ACT，2023）：一次推理预测未来 H 步动作，降低推理频率要求；相邻块重叠部分用 temporal ensembling 平滑。π0 系列用 50 步的块。</li>
+        <li><b>异步推理</b>：执行当前块的同时就开始推理下一块，机器人不需要停下来等模型（LeRobot 的 PolicyServer + RobotClient 架构，SmolVLA 论文中提出）。</li>
+        <li><b>Real-Time Chunking（RTC，Physical Intelligence 2025）</b>：异步时新块和正在执行的块会“接不上”。RTC 把生成新块看作 inpainting：推理延迟期间必定会执行的动作被冻结，其余部分被引导与之衔接，在不重新训练的前提下得到平滑连续的动作。</li>
+        <li><b>快慢双系统</b>：把慢的语义理解和快的运动控制解耦，各自按自己的频率运行（Helix、GR00T）。</li>
+        <li><b>压缩与编译</b>：INT8 / FP8 / INT4 量化、TensorRT 引擎、更少的 flow 积分步、蒸馏小策略；batch = 1 时 kernel launch 开销占比高，CUDA graph / JAX jit 很关键。</li>
+        <li><b>远程推理</b>：机器人只做传感与控制，策略跑在附近的 GPU 上（openpi 用 websocket 提供策略服务）；要处理网络抖动和断连回退。</li>
+        <li><b>仿真与世界模型</b>：训练和评测依赖大规模 GPU 仿真（Isaac Sim / Isaac Lab）和视频世界模型（NVIDIA Cosmos 等），它们本身也是推理负载（大批量、扩散生成）。</li>
+      </ul>
+      <figure class="figure" id="fig-rtc"><div class="fig-body"></div>
+        <figcaption><b>同步 vs 异步执行。</b>同步：每次推理时机器人停下等待，动作不连贯。异步（+ RTC）：推理与执行重叠，延迟期间执行旧块中已承诺的动作，新块从衔接点接上，运动连续。</figcaption>
+      </figure>
+      <script>
+      gantt("fig-rtc", { w: 920, max: 40, labelW: 150, rowH: 26, top: 22, rows: ["同步 · 推理", "同步 · 执行", "", "异步 · 推理", "异步 · 执行"], ticks: 5, tickLabels: false, axis: "时间 →", bars: [
+        { r: 0, s: 0, e: 6, t: "推理", k: "acc" }, { r: 1, s: 6, e: 16, t: "执行块 1", k: "pass" }, { r: 0, s: 16, e: 22, t: "推理", k: "acc" }, { r: 1, s: 16, e: 22, t: "停顿", k: "todos" }, { r: 1, s: 22, e: 32, t: "执行块 2", k: "pass" }, { r: 1, s: 32, e: 38, t: "停顿", k: "todos" },
+        { r: 3, s: 0, e: 6, t: "推理 1", k: "acc" }, { r: 3, s: 10, e: 16, t: "推理 2", k: "acc" }, { r: 3, s: 20, e: 26, t: "推理 3", k: "acc" }, { r: 3, s: 30, e: 36, t: "推理 4", k: "acc" },
+        { r: 4, s: 6, e: 16, t: "块 1", k: "pass" }, { r: 4, s: 16, e: 26, t: "块 2（冻结前缀衔接）", k: "pass" }, { r: 4, s: 26, e: 36, t: "块 3", k: "pass" }, { r: 4, s: 36, e: 40, t: "…", k: "pass" }
+      ]});
+      </script>
+      <h3>框架</h3>
+      <div class="table-box"><table>
+        <thead><tr><th>项目</th><th>定位</th></tr></thead>
+        <tbody>
+          <tr><td class="k"><a href="https://github.com/huggingface/lerobot">LeRobot</a></td><td>Hugging Face 的机器人学习库：数据集格式、ACT / Diffusion Policy / π0 / SmolVLA 等策略、异步推理服务</td></tr>
+          <tr><td class="k"><a href="https://github.com/Physical-Intelligence/openpi">openpi</a></td><td>π0 / π0.5 的开源实现（JAX / PyTorch），自带 websocket 策略服务器</td></tr>
+          <tr><td class="k"><a href="https://github.com/NVIDIA/Isaac-GR00T">Isaac GR00T</a></td><td>NVIDIA 人形机器人基础模型，含 TensorRT 部署到 Jetson 的流程</td></tr>
+          <tr><td class="k">Isaac ROS / Holoscan、ROS 2</td><td>机载传感器流水线与机器人中间件（DDS 通信、实时调度）</td></tr>
+          <tr><td class="k"><a href="https://github.com/dora-rs/dora">dora-rs</a></td><td>Rust 写的低延迟机器人数据流框架，零拷贝共享内存</td></tr>
+          <tr><td class="k">vLLM-Omni</td><td>已把 π0.5、GR00T 等机器人策略模型纳入统一的服务运行时（云端 / 机队场景）</td></tr>
+        </tbody>
+      </table></div>
+      <div class="srcs"><span class="srcs-label">源码</span>{{s:huggingface/lerobot:src/lerobot/scripts/lerobot_policy_server.py|LeRobot policy server}}{{s:Physical-Intelligence/openpi:src/openpi/serving/websocket_policy_server.py|openpi websocket_policy_server.py}}{{s:NVIDIA/Isaac-GR00T:gr00t/deployment|GR00T deployment/}}{{r:dora-rs/dora|dora-rs}}{{w:Physical-Intelligence/openpi|openpi · Code Wiki}}{{w:huggingface/lerobot|LeRobot · Code Wiki}}</div>
+    </section>
+

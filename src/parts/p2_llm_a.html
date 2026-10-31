@@ -1,0 +1,251 @@
+
+    <section id="problems">
+      <h2><span class="no">03</span>需要解决的问题</h2>
+      <p>把上一节的限制落到一个朴素实现上（HuggingFace <code>generate()</code> 套一层 HTTP）会暴露出下面这些具体问题。后面每一项技术都可以对应回这张表；面试时先说“它解决哪个问题”，再说怎么做。</p>
+      <div class="table-box"><table>
+        <thead><tr><th>#</th><th>问题</th><th>朴素实现里的表现</th><th>根因（对应限制）</th></tr></thead>
+        <tbody>
+          <tr><td class="k">P1</td><td>KV 显存浪费与碎片</td><td>按 max_len 给每个请求预留连续 KV 空间，实际利用率只有 20–40%（vLLM 论文的测量）</td><td>输出长度未知 + 连续分配</td></tr>
+          <tr><td class="k">P2</td><td>批内空等</td><td>静态批里短请求结束后，GPU 槽位一直空到最长的请求结束</td><td>请求异构</td></tr>
+          <tr><td class="k">P3</td><td>decode 吃不饱 GPU</td><td>并发小 → 批小 → 带宽利用率低、每 token 成本高</td><td>decode 是 memory-bound，且 KV 占满显存</td></tr>
+          <tr><td class="k">P4</td><td>prefill 与 decode 互相干扰</td><td>一个长 prompt 进来，所有正在生成的请求卡住几百毫秒</td><td>两阶段算力特征不同却共享 GPU</td></tr>
+          <tr><td class="k">P5</td><td>重复计算</td><td>同一系统 prompt / 多轮历史每次都重新 prefill</td><td>KV 没有跨请求复用</td></tr>
+          <tr><td class="k">P6</td><td>单请求太慢</td><td>小批时每 token 时间由读权重决定，再优化 kernel 也有下限</td><td>自回归串行</td></tr>
+          <tr><td class="k">P7</td><td>模型放不下 / 太慢</td><td>70B BF16 要 140 GB；671B 要上千 GB</td><td>显存容量、互联带宽</td></tr>
+          <tr><td class="k">P8</td><td>CPU 与框架开销</td><td>Python 调度、kernel launch 占 decode step 的显著比例</td><td>decode step 只有几毫秒</td></tr>
+          <tr><td class="k">P9</td><td>kernel 效率低</td><td>attention 物化 N×N 矩阵；小 GEMM 用不满 Tensor Core</td><td>访存模式、硬件特性</td></tr>
+          <tr><td class="k">P10</td><td>长上下文</td><td>128k 上下文时 KV 和 attention 计算爆炸</td><td>KV 线性增长、attention 二次方</td></tr>
+          <tr><td class="k">P11</td><td>多租户与定制</td><td>每个客户一个微调模型，每个都要单独部署</td><td>权重不共享</td></tr>
+          <tr><td class="k">P12</td><td>输出必须合法</td><td>要求 JSON / 函数调用，模型偶尔输出非法格式</td><td>采样是逐 token 的</td></tr>
+          <tr><td class="k">P13</td><td>流量波动与成本</td><td>按峰值部署浪费，按均值部署会排队</td><td>扩容慢、负载突发</td></tr>
+        </tbody>
+      </table></div>
+      <figure class="figure" id="fig-p2t"><div class="fig-body"></div>
+        <figcaption><b>问题 → 技术映射。</b>悬停左侧某个问题，可以只看解决它的技术；悬停右侧某项技术，可以看它同时缓解了哪些问题（例如 PagedAttention 同时缓解 P1 和 P3）。</figcaption>
+      </figure>
+      <script>
+      flow("fig-p2t", { w: 900, h: 690, dir: "h", label: "问题到技术的映射", nodes: [
+        { id: "P1", x: 150, y: 40, t: "P1 KV 浪费 / 碎片", k: "todo", w: 220 },
+        { id: "P2", x: 150, y: 92, t: "P2 批内空等", k: "todo", w: 220 },
+        { id: "P3", x: 150, y: 144, t: "P3 decode 吃不饱", k: "todo", w: 220 },
+        { id: "P4", x: 150, y: 196, t: "P4 prefill/decode 干扰", k: "todo", w: 220 },
+        { id: "P5", x: 150, y: 248, t: "P5 重复计算前缀", k: "todo", w: 220 },
+        { id: "P6", x: 150, y: 300, t: "P6 单请求太慢", k: "todo", w: 220 },
+        { id: "P7", x: 150, y: 352, t: "P7 模型放不下", k: "todo", w: 220 },
+        { id: "P8", x: 150, y: 404, t: "P8 CPU / 框架开销", k: "todo", w: 220 },
+        { id: "P9", x: 150, y: 456, t: "P9 kernel 效率", k: "todo", w: 220 },
+        { id: "P10", x: 150, y: 508, t: "P10 长上下文", k: "todo", w: 220 },
+        { id: "P11", x: 150, y: 560, t: "P11 多租户 / 定制", k: "todo", w: 220 },
+        { id: "P12", x: 150, y: 612, t: "P12 输出必须合法", k: "todo", w: 220 },
+        { id: "P13", x: 150, y: 664, t: "P13 流量波动", k: "todo", w: 220 },
+        { id: "cb", x: 740, y: 40, t: "Continuous batching", k: "pass", w: 240, href: "#batching" },
+        { id: "pa", x: 740, y: 92, t: "PagedAttention", k: "pass", w: 240, href: "#kv" },
+        { id: "pc", x: 740, y: 144, t: "Prefix cache / RadixAttention", k: "pass", w: 240, href: "#kv" },
+        { id: "ho", x: 740, y: 196, t: "KV 分层存储 / offload", k: "pass", w: 240, href: "#kv" },
+        { id: "ck", x: 740, y: 248, t: "Chunked prefill", k: "pass", w: 240, href: "#chunked" },
+        { id: "pd", x: 740, y: 300, t: "PD 分离", k: "pass", w: 240, href: "#pd" },
+        { id: "sd", x: 740, y: 352, t: "投机解码 / MTP", k: "pass", w: 240, href: "#spec" },
+        { id: "kn", x: 740, y: 404, t: "FlashAttention / FlashInfer", k: "pass", w: 240, href: "#kernels" },
+        { id: "cg", x: 740, y: 456, t: "CUDA graph / 重叠调度", k: "pass", w: 240, href: "#kernels" },
+        { id: "qt", x: 740, y: 508, t: "量化 FP8 / FP4 / KV 量化", k: "pass", w: 240, href: "#quant" },
+        { id: "ar", x: 740, y: 560, t: "GQA / MLA / 稀疏 / 线性注意力", k: "pass", w: 240, href: "#arch" },
+        { id: "pl", x: 740, y: 612, t: "TP / PP / EP / CP 并行", k: "pass", w: 240, href: "#parallel" },
+        { id: "lo", x: 740, y: 664, t: "Multi-LoRA · 结构化输出 · 路由扩缩", k: "pass", w: 240, href: "#tenancy" }
+      ], edges: [
+        { f: "P1", t: "pa" }, { f: "P2", t: "cb" }, { f: "P3", t: "cb" }, { f: "P3", t: "pa" }, { f: "P3", t: "qt" }, { f: "P3", t: "ar" },
+        { f: "P4", t: "ck" }, { f: "P4", t: "pd" }, { f: "P5", t: "pc" }, { f: "P5", t: "ho" },
+        { f: "P6", t: "sd" }, { f: "P6", t: "qt" }, { f: "P7", t: "pl" }, { f: "P7", t: "qt" },
+        { f: "P8", t: "cg" }, { f: "P9", t: "kn" }, { f: "P10", t: "ar" }, { f: "P10", t: "ho" }, { f: "P10", t: "pl" }, { f: "P10", t: "ck" },
+        { f: "P11", t: "lo" }, { f: "P12", t: "lo" }, { f: "P13", t: "lo" }, { f: "P13", t: "pd" }
+      ]});
+      </script>
+    </section>
+
+    <section id="llm">
+      <h2><span class="no">04</span>LLM serving 的核心技术</h2>
+      <p>这一节按“它解决哪个问题”组织。现代引擎（vLLM、SGLang、TensorRT-LLM）几乎都实现了全部这些技术，差异在实现细节、默认值和组合方式上。</p>
+
+      <h3>通用 LLM：模型特征 → 场景 → 推理负载</h3>
+      <div class="table-box"><table class="chain">
+        <thead><tr><th>模型特征</th><th>为什么这样设计（场景决定）</th><th>在推理负载上的体现</th></tr></thead>
+        <tbody><tr><td>Decoder-only Transformer，自回归逐 token 生成</td><td>训练目标是 next-token prediction，生成即逐步采样</td><td>decode 串行、每步读全部权重 → memory-bound；并行只能来自批、投机或多 token 预测</td></tr><tr><td>KV cache（因果注意力，历史 K/V 不变）</td><td>避免每步重算历史 token</td><td>显存随并发 × 上下文线性增长，成为并发上限 → 分页、前缀复用、分层存储、KV 量化</td></tr><tr><td>GQA / MLA 等压缩 KV 的注意力</td><td>长上下文和高并发是主流需求</td><td>每 token KV 小一个数量级 → 同样显存下批更大；但需要专门 kernel 与并行方式（DP attention）</td></tr><tr><td>超大词表（15 万+）与长上下文（128k+）</td><td>多语言、代码、长文档</td><td>LM head GEMM 与采样不再可忽略；长 prompt 的 prefill 成为 TTFT 主体</td></tr><tr><td>聊天模板 + 系统 prompt + 工具定义</td><td>产品形态是多轮对话与 agent</td><td>大量请求共享前缀 → 前缀 cache 命中率高；会话粘性路由</td></tr></tbody>
+      </table></div>
+      <h3 id="batching">4.1 批处理与调度：continuous batching</h3>
+      <div class="srcs"><span class="srcs-label">源码</span>{{s:vllm-project/vllm:vllm/v1/core/sched/scheduler.py|vLLM scheduler.py}}{{s:vllm-project/vllm:vllm/v1/engine/core.py|vLLM engine/core.py}}{{s:vllm-project/vllm:vllm/v1/worker/gpu_input_batch.py|persistent batch}}{{s:sgl-project/sglang:python/sglang/srt/managers/scheduler.py|SGLang scheduler.py}}{{s:sgl-project/sglang:python/sglang/srt/managers/schedule_policy.py|schedule_policy.py}}{{s:sgl-project/sglang:python/sglang/srt/managers/schedule_batch.py|schedule_batch.py}}{{s:NVIDIA/TensorRT-LLM:tensorrt_llm/_torch/pyexecutor/py_executor.py|TRT-LLM py_executor}}</div>
+      <p><b>解决 P2、P3。</b>朴素的静态批（static batching）把 N 个请求凑成一批，直到最长的那个结束才能换下一批。Orca（OSDI ’22）提出 <b>iteration-level scheduling</b>：调度粒度从“一个请求”降到“一次前向迭代”，每一步结束后，完成的请求立刻退出、等待的请求立刻补进来。这就是 continuous batching（也叫 in-flight batching）。</p>
+      <figure class="figure" id="fig-cb"><div class="fig-body"></div>
+        <figcaption><b>同样 7 个请求、4 个槽位。</b>上：静态批，灰色是空等的槽位，E/F/G 要等第一批全部结束。下：continuous batching，每次迭代后空槽立刻被新请求填上，总时间短得多。</figcaption>
+      </figure>
+      <script>
+      gantt("fig-cb", { w: 920, max: 30, labelW: 150, rowH: 24, top: 18, rows: ["静态批 · 槽 1", "槽 2", "槽 3", "槽 4", "", "continuous · 槽 1", "槽 2", "槽 3", "槽 4"], ticks: 2, tickLabels: false, axis: "迭代（decode step）→", bars: [
+        { r: 0, s: 0, e: 14, t: "A", k: "acc" }, { r: 1, s: 0, e: 5, t: "B", k: "pass" }, { r: 1, s: 5, e: 14, t: "空等", k: "m" },
+        { r: 2, s: 0, e: 8, t: "C", k: "warn" }, { r: 2, s: 8, e: 14, t: "空等", k: "m" }, { r: 3, s: 0, e: 4, t: "D", k: "vio" }, { r: 3, s: 4, e: 14, t: "空等", k: "m" },
+        { r: 0, s: 14, e: 20, t: "E", k: "teal" }, { r: 1, s: 14, e: 23, t: "F", k: "todo" }, { r: 2, s: 14, e: 19, t: "G", k: "acc" },
+        { r: 5, s: 0, e: 14, t: "A", k: "acc" }, { r: 6, s: 0, e: 5, t: "B", k: "pass" }, { r: 6, s: 5, e: 14, t: "F", k: "todo" },
+        { r: 7, s: 0, e: 8, t: "C", k: "warn" }, { r: 7, s: 8, e: 13, t: "G", k: "acc" }, { r: 8, s: 0, e: 4, t: "D", k: "vio" }, { r: 8, s: 4, e: 10, t: "E", k: "teal" }
+      ], marks: [{ x: 23, t: "静态批结束", k: "todo" }, { x: 14, t: "continuous 结束", k: "pass", dx: -4, a: "end" }]});
+      </script>
+      <h4>和 continuous batching 配套的几件事</h4>
+      <ul class="facts">
+        <li><b>Selective batching / 扁平化。</b>线性层（QKV 投影、MLP）不关心 token 属于哪个请求，把所有请求的 token 拼成一个 <code>[总 token 数, hidden]</code> 张量一起算，没有 padding；只有 attention 按请求分开（varlen / paged attention kernel）。</li>
+        <li><b>Token budget。</b>每步最多处理 <code>max_num_batched_tokens</code> 个 token、最多 <code>max_num_seqs</code> 个请求，控制单步时长和激活显存。vLLM V1 把 prefill 和 decode 统一看成“给每个请求分配本步要算的 token 数”，于是 chunked prefill、前缀 cache、投机解码都落在同一套逻辑里。</li>
+        <li><b>抢占（preemption）。</b>KV 不够时把某些请求踢出：<i>recompute</i>（丢掉 KV，之后重新 prefill，vLLM 默认）或 <i>swap</i>（KV 拷到 CPU 内存）。抢占频繁说明并发超过了 KV 容量。</li>
+        <li><b>调度策略。</b>FCFS 最常见；还有优先级调度、公平调度（如 OSDI ’24 的 VTC，按租户已服务 token 数做公平）、按预测输出长度排序（近似最短作业优先，降低平均延迟）、SLO 感知调度。SGLang 还有 cache-aware 调度：优先调度前缀命中长的请求。</li>
+      </ul>
+
+      <h3 id="kv">4.2 KV cache 管理：PagedAttention、前缀缓存、分层存储</h3>
+      <h4>PagedAttention（vLLM，SOSP ’23）</h4>
+      <div class="srcs"><span class="srcs-label">源码</span>{{s:vllm-project/vllm:vllm/v1/core/kv_cache_manager.py|kv_cache_manager.py}}{{s:vllm-project/vllm:vllm/v1/core/block_pool.py|block_pool.py}}{{s:vllm-project/vllm:vllm/v1/core/single_type_kv_cache_manager.py|single_type_kv_cache_manager.py}}{{s:vllm-project/vllm:csrc/cache_kernels.cu|cache_kernels.cu}}{{s:sgl-project/sglang:python/sglang/srt/mem_cache/memory_pool.py|SGLang memory_pool.py}}</div>
+      <p><b>解决 P1，间接解决 P3。</b>借鉴操作系统的虚拟内存分页：KV 被切成固定大小的 block（默认 16 个 token），每个请求有一张 <b>block table</b> 把逻辑 block 映射到任意位置的物理 block，按需分配。浪费只剩每个请求最后一个没填满的 block。论文报告已有系统浪费 60–80% 的 KV 显存，vLLM 降到 4% 以下，吞吐提升 2–4 倍。分页还让共享变得容易：并行采样、beam search 的公共前缀只存一份，靠引用计数 + copy-on-write。</p>
+      <figure class="figure" id="fig-paged"><div class="fig-body"></div>
+        <figcaption><b>Block table。</b>请求 A、B 的逻辑 block 连续，物理 block 可以散落在显存任意位置。两个请求共享系统 prompt 所在的物理 block 7（引用计数 = 2），写入时才复制。attention kernel 根据 block table 间接寻址。</figcaption>
+      </figure>
+      <script>
+      flow("fig-paged", { w: 920, h: 350, label: "PagedAttention block table", nodes: [
+        { id: "a0", x: 90, y: 60, t: "A · 逻辑 0", s: "系统 prompt", k: "acc", w: 120 },
+        { id: "a1", x: 90, y: 120, t: "A · 逻辑 1", s: "用户问题", k: "acc", w: 120 },
+        { id: "a2", x: 90, y: 180, t: "A · 逻辑 2", s: "生成中 (9/16)", k: "acc", w: 120 },
+        { id: "b0", x: 90, y: 250, t: "B · 逻辑 0", s: "系统 prompt", k: "vio", w: 120 },
+        { id: "b1", x: 90, y: 310, t: "B · 逻辑 1", s: "生成中 (3/16)", k: "vio", w: 120, h: 40 },
+        { id: "bt", x: 360, y: 185, t: "Block table", s: "A: [7, 2, 11]\nB: [7, 4]\nref(7) = 2", k: "warn", w: 160, h: 90 },
+        { id: "p2", x: 650, y: 75, t: "物理 2", s: "A 的问题", k: "acc", w: 110 },
+        { id: "p4", x: 800, y: 140, t: "物理 4", s: "B 生成中", k: "vio", w: 110 },
+        { id: "p7", x: 650, y: 205, t: "物理 7", s: "共享前缀", k: "pass", w: 110 },
+        { id: "p11", x: 800, y: 268, t: "物理 11", s: "A 生成中", k: "acc", w: 110 },
+        { id: "fr", x: 650, y: 315, t: "空闲 block 池", s: "按需分配", w: 130, h: 44 }
+      ], edges: [
+        { f: "a0", t: "bt", k: "acc" }, { f: "a1", t: "bt", k: "acc" }, { f: "a2", t: "bt", k: "acc" }, { f: "b0", t: "bt", k: "vio" }, { f: "b1", t: "bt", k: "vio" },
+        { f: "bt", t: "p7", k: "pass", l: "A0, B0" }, { f: "bt", t: "p2", k: "acc" }, { f: "bt", t: "p11", k: "acc" }, { f: "bt", t: "p4", k: "vio" }, { f: "fr", t: "bt", d: true, fs: "l", ts: "b", l: "新 block" }
+      ], groups: [{ x: 570, y: 14, w: 340, h: 328, t: "GPU 显存中的 KV 池" }]});
+      </script>
+
+      <h4>前缀缓存：vLLM APC 与 SGLang RadixAttention</h4>
+      <div class="srcs"><span class="srcs-label">源码</span>{{s:vllm-project/vllm:vllm/v1/core/kv_cache_utils.py|vLLM block 哈希 kv_cache_utils.py}}{{s:sgl-project/sglang:python/sglang/srt/mem_cache/radix_cache.py|SGLang radix_cache.py}}</div>
+      <p><b>解决 P5。</b>请求结束后不立刻释放 KV，而是留作 cache；新请求如果前缀相同就直接复用，只 prefill 不同的部分，TTFT 和算力都省下来。两种主流实现：</p>
+      <div class="two">
+        <div class="card"><h4>vLLM Automatic Prefix Caching</h4><p>以满 block 为单位，每个 block 的 key = hash(父 block 的 hash, 本 block 的 token, 额外信息如 LoRA / 多模态 hash)。全局哈希表查找；引用计数为 0 的 block 进入 LRU 空闲队列，被复用前仍可命中。实现简单、开销 O(1)。</p></div>
+        <div class="card vio"><h4>SGLang RadixAttention</h4><p>把所有缓存的 token 序列组织成一棵 radix tree（压缩前缀树），边上是 token 序列，节点挂着对应的 KV。匹配就是从根往下走最长前缀；淘汰按 LRU 从叶子开始。配合 cache-aware 调度（优先最长前缀匹配），对多轮对话、few-shot、tree-of-thought 等复杂共享模式很友好。</p></div>
+      </div>
+      <figure class="figure" id="fig-radix"><div class="fig-body"></div>
+        <figcaption><b>Radix tree 示意。</b>三个请求共享系统 prompt；其中两个是同一会话的多轮对话，共享到第一轮回答。新请求只需从匹配结束的节点继续 prefill。被引用的节点不能淘汰，叶子按 LRU 淘汰。</figcaption>
+      </figure>
+      <script>
+      flow("fig-radix", { w: 920, h: 300, label: "RadixAttention 前缀树", nodes: [
+        { id: "root", x: 70, y: 150, t: "root", k: "dark", w: 70 },
+        { id: "sys", x: 250, y: 150, t: "系统 prompt", s: "1,200 tokens · ref 3", k: "pass", w: 170 },
+        { id: "u1", x: 480, y: 70, t: "会话 1 · 第 1 轮", s: "问题 + 回答", k: "acc", w: 160 },
+        { id: "u2", x: 480, y: 230, t: "会话 2 · 第 1 轮", s: "LRU 候选", k: "m", w: 160 },
+        { id: "t2", x: 720, y: 40, t: "会话 1 · 第 2 轮", s: "命中 → 只算新问题", k: "acc", w: 170 },
+        { id: "fs", x: 720, y: 120, t: "会话 1 · 分支", s: "重新生成（另一个采样）", k: "vio", w: 170 },
+        { id: "new", x: 720, y: 230, t: "新请求", s: "匹配到系统 prompt 为止", k: "warn", w: 170 }
+      ], edges: [
+        { f: "root", t: "sys", k: "pass" }, { f: "sys", t: "u1", k: "acc" }, { f: "sys", t: "u2" }, { f: "u1", t: "t2", k: "acc" }, { f: "u1", t: "fs", k: "vio" }, { f: "sys", t: "new", k: "warn", d: true, l: "从这里继续 prefill" }
+      ]});
+      </script>
+
+      <h4>KV 分层存储与 offload</h4>
+      <div class="srcs"><span class="srcs-label">源码</span>{{s:vllm-project/vllm:vllm/v1/kv_offload|vLLM kv_offload/}}{{s:sgl-project/sglang:python/sglang/srt/mem_cache/hicache_storage.py|SGLang hicache_storage.py}}{{r:LMCache/LMCache|LMCache}}{{s:kvcache-ai/Mooncake:mooncake-store|Mooncake Store}}{{s:ai-dynamo/dynamo:lib/llm/src/kv_router|Dynamo kv_router}}</div>
+      <p><b>解决 P5、P10。</b>GPU 显存装不下所有值得缓存的前缀（多轮对话、agent 的长上下文、多副本之间的共享），于是把 KV 下沉到 CPU 内存、本地 SSD、甚至远端分布式存储，命中时再载回。判断是否值得的数量级：</p>
+      <div class="formula">Llama-3-8B，10k token 前缀：KV = 10k × 128 KiB ≈ 1.25 GiB
+  从 CPU 载回（PCIe Gen5，约 50 GB/s 实际）：≈ 25 ms
+  重新 prefill：2 × 8e9 × 1e4 = 1.6e14 FLOP，按 600 TFLOP/s 有效算力 ≈ 270 ms
+→ 载回比重算快约 10 倍；上下文越长、模型越大，差距越大</div>
+      <ul class="facts">
+        <li><b>开源实现：</b>LMCache（vLLM 生态的 KV 存储层，CPU / 磁盘 / 远端后端）、Mooncake Store（Kimi 的 KVCache-centric 架构，利用集群空闲的 CPU 内存和 SSD，RDMA 传输）、SGLang HiCache（GPU → CPU → 存储三级 radix cache）、NVIDIA Dynamo KVBM（KV block manager）。</li>
+        <li><b>商业 API 的体现：</b>DeepSeek 的上下文硬盘缓存、Anthropic / OpenAI 的 prompt caching（命中部分价格大幅打折）。</li>
+        <li><b>KV 量化（FP8 / INT8）</b>也是一种“扩容”：容量翻倍、attention 读带宽减半，通常精度损失很小。</li>
+      </ul>
+
+      <h3 id="chunked">4.3 Chunked prefill：把 prefill 切碎塞进 decode 批</h3>
+      <div class="srcs"><span class="srcs-label">源码</span>{{s:vllm-project/vllm:vllm/v1/core/sched/scheduler.py|vLLM：token budget 内拆分 prefill}}{{s:sgl-project/sglang:python/sglang/srt/managers/schedule_policy.py|SGLang：PrefillAdder 与 chunked req}}</div>
+      <p><b>解决 P4。</b>长 prompt 的 prefill 一次要跑几百毫秒，期间同一 GPU 上所有 decode 请求都停住，ITL 出现尖峰。Sarathi-Serve（OSDI ’24）把 prefill 切成固定大小的 chunk，每次迭代 = 所有 decode token + 一个 prefill chunk，凑满 token budget。这样 decode 永不被长时间阻塞（stall-free），而 prefill chunk 正好把 decode 批“吃不饱”的算力用掉。</p>
+      <figure class="figure" id="fig-chunk"><div class="fig-body"></div>
+        <figcaption><b>上：不切分。</b>请求 X 的 4k prefill 独占一次迭代，A/B/C 的 decode 停顿。<b>下：chunked prefill。</b>每次迭代混合 decode + 1k 的 prefill chunk，单步变长一点点，但不再有停顿。</figcaption>
+      </figure>
+      <script>
+      gantt("fig-chunk", { w: 920, max: 40, labelW: 150, rowH: 26, top: 22, rows: ["不切分 · GPU", "A/B/C 看到的输出", "", "Chunked · GPU", "A/B/C 看到的输出"], ticks: 5, tickLabels: false, axis: "时间 →", bars: [
+        { r: 0, s: 0, e: 3, t: "dec", k: "pass" }, { r: 0, s: 3, e: 6, t: "dec", k: "pass" }, { r: 0, s: 6, e: 22, t: "X 的 prefill 4k", k: "acc" }, { r: 0, s: 22, e: 25, t: "dec", k: "pass" }, { r: 0, s: 25, e: 28, t: "dec", k: "pass" }, { r: 0, s: 28, e: 31, t: "dec", k: "pass" },
+        { r: 1, s: 2.6, e: 3, k: "pass" }, { r: 1, s: 5.6, e: 6, k: "pass" }, { r: 1, s: 6, e: 22, t: "停顿 ≈ 整个 prefill", k: "warns" }, { r: 1, s: 24.6, e: 25, k: "pass" }, { r: 1, s: 27.6, e: 28, k: "pass" }, { r: 1, s: 30.6, e: 31, k: "pass" },
+        { r: 3, s: 0, e: 3, t: "dec", k: "pass" }, { r: 3, s: 3, e: 8, t: "dec+1k", k: "teal" }, { r: 3, s: 8, e: 13, t: "dec+1k", k: "teal" }, { r: 3, s: 13, e: 18, t: "dec+1k", k: "teal" }, { r: 3, s: 18, e: 23, t: "dec+1k", k: "teal" }, { r: 3, s: 23, e: 26, t: "dec", k: "pass" }, { r: 3, s: 26, e: 29, t: "dec", k: "pass" },
+        { r: 4, s: 2.6, e: 3, k: "pass" }, { r: 4, s: 7.6, e: 8, k: "pass" }, { r: 4, s: 12.6, e: 13, k: "pass" }, { r: 4, s: 17.6, e: 18, k: "pass" }, { r: 4, s: 22.6, e: 23, k: "pass" }, { r: 4, s: 25.6, e: 26, k: "pass" }, { r: 4, s: 28.6, e: 29, k: "pass" }
+      ]});
+      </script>
+      <ul class="facts">
+        <li><b>权衡：</b>chunk 越小，ITL 越平稳，但 prefill 效率下降（每个 chunk 要重读之前 chunk 的 KV、GEMM 变小），X 自己的 TTFT 变长。常见 token budget 是 2k–8k，根据 TPOT SLO 调。</li>
+        <li><b>与 PD 分离的关系：</b>chunked prefill 是“同一 GPU 内做时间上的隔离”，PD 分离是“换不同 GPU 做空间上的隔离”。中小规模部署用 chunked prefill 通常就够了；它在 vLLM V1 中默认开启。</li>
+      </ul>
+
+      <h3 id="pd">4.4 Prefill–Decode 分离（PD disaggregation）</h3>
+      <div class="srcs"><span class="srcs-label">源码</span>{{s:vllm-project/vllm:vllm/distributed/kv_transfer/kv_connector/v1/base.py|vLLM KVConnector 接口}}{{s:vllm-project/vllm:vllm/distributed/kv_transfer/kv_connector/v1/nixl|NixlConnector}}{{s:vllm-project/vllm:vllm/distributed/kv_transfer/kv_connector/v1/lmcache_connector.py|LMCacheConnector}}{{s:sgl-project/sglang:python/sglang/srt/disaggregation/prefill.py|SGLang PD prefill.py}}{{s:sgl-project/sglang:python/sglang/srt/disaggregation/decode.py|decode.py}}{{s:sgl-project/sglang:python/sglang/srt/disaggregation/mooncake/conn.py|mooncake/conn.py}}{{s:ai-dynamo/nixl:src/api|NIXL API}}{{s:kvcache-ai/Mooncake:mooncake-transfer-engine|Mooncake Transfer Engine}}</div>
+      <p><b>解决 P4，并让两阶段可以独立选并行度、硬件和扩缩容。</b>prefill 是 compute-bound、关心 TTFT；decode 是 memory-bound、关心 TPOT 和大批。放在一起时，无论怎么调度都在两个 SLO 之间妥协。DistServe（OSDI ’24）、Splitwise（ISCA ’24）、Mooncake（FAST ’25）把它们放到不同的 GPU 池，prefill 算完后把 KV cache 通过 RDMA / NVLink 传给 decode 实例。DistServe 报告在同样 SLO 下最多可服务 7.4 倍的请求。</p>
+      <figure class="figure" id="fig-pd"><div class="fig-body"></div>
+        <figcaption><b>PD 分离的数据流。</b>路由器选择 prefill 和 decode 实例（考虑前缀命中和负载）；decode 端先预留 KV 空间；prefill 逐层算完后把 KV 通过 RDMA 直接写进 decode 端显存（可与计算重叠）；之后 decode 端独立生成，流式返回。</figcaption>
+      </figure>
+      <script>
+      flow("fig-pd", { w: 940, h: 370, label: "PD 分离架构", nodes: [
+        { id: "c", x: 70, y: 200, t: "Client", w: 100 },
+        { id: "r", x: 220, y: 200, t: "Router / Proxy", s: "前缀命中 + 负载\n选 P 和 D 实例", k: "acc", w: 160 },
+        { id: "p1", x: 470, y: 108, t: "Prefill 实例 1", s: "TP 较大 · 大 chunk\ncompute-bound", k: "warn", w: 170 },
+        { id: "p2", x: 470, y: 192, t: "Prefill 实例 2", s: "…", k: "warn", w: 170, h: 40 },
+        { id: "d1", x: 780, y: 108, t: "Decode 实例 1", s: "大批 · 宽 EP\nmemory-bound", k: "pass", w: 170 },
+        { id: "d2", x: 780, y: 192, t: "Decode 实例 2", s: "…", k: "pass", w: 170, h: 40 },
+        { id: "x", x: 625, y: 295, t: "KV 传输层", s: "NIXL · Mooncake TE · UCX\nRDMA / NVLink，逐层流水", k: "vio", w: 220 }
+      ], edges: [
+        { f: "c", t: "r", k: "acc" }, { f: "r", t: "p1", k: "warn", l: "① prompt" }, { f: "r", t: "d1", k: "pass", l: "② 预留 KV", fs: "t", ts: "t", st: true, my: 22 },
+        { f: "p1", t: "x", k: "vio", fs: "b", ts: "l", fo: -50, l: "③ KV blocks" }, { f: "x", t: "d1", k: "vio", fs: "r", ts: "b", fo: 0, to: 50, a: true },
+        { f: "d1", t: "c", k: "pass", fs: "r", ts: "b", st: true, l: "④ 流式 token（经 router 或直连）", d: true, mx: 905, lx: 330 }
+      ], groups: [{ x: 375, y: 44, w: 190, h: 180, t: "Prefill 池", k: "warn" }, { x: 685, y: 44, w: 190, h: 180, t: "Decode 池", k: "pass" }]});
+      </script>
+      <div class="two">
+        <div class="card pass"><h4>收益</h4><ul>
+          <li>TTFT 与 TPOT 解耦，各自满足 SLO，goodput 提升。</li>
+          <li>两池可以用不同并行度：prefill 用 TP 降 TTFT，decode 用大 DP + 宽 EP 撑大批（DeepSeek 就是这样，见 <a href="#moe">05</a>）。</li>
+          <li>P:D 比例按负载独立扩缩（长 prompt 多就多加 P）。</li>
+          <li>可以用不同硬件（如算力强的卡做 P，显存带宽大的卡做 D）。</li>
+        </ul></div>
+        <div class="card warn"><h4>代价与适用条件</h4><ul>
+          <li>要传 KV：70B 模型 4k prompt 约 1.25 GiB；单张 400G 网卡约 25 ms，8 卡并行约 3 ms。需要 RDMA 和逐层流水才能藏住。</li>
+          <li>系统复杂：两套实例、路由、失败处理、KV 生命周期。</li>
+          <li>小模型、短 prompt、小集群时收益有限，chunked prefill 更划算。</li>
+        </ul></div>
+      </div>
+      <ul class="facts">
+        <li><b>实现：</b>vLLM 的 KV Connector 抽象（NixlConnector、LMCacheConnector、P2pNcclConnector、Mooncake 等），SGLang 的 PD 模式（Mooncake / NIXL 传输后端 + bootstrap 握手），NVIDIA Dynamo 和 llm-d 在集群层编排 PD。</li>
+        <li><b>进一步的拆分：</b>EPD（把多模态 encoder 也拆出去，见 <a href="#omni">09</a>）、AF 分离（attention 与 FFN/专家分到不同 GPU，例如字节的 MegaScale-Infer、阶跃星辰 Step-3 的 AFD），本质都是“按算力特征把模型的不同部分放到最合适的资源上”。</li>
+      </ul>
+
+      <h3 id="spec">4.5 投机解码（Speculative decoding）</h3>
+      <div class="srcs"><span class="srcs-label">源码</span>{{s:vllm-project/vllm:vllm/v1/spec_decode/eagle.py|vLLM eagle.py}}{{s:vllm-project/vllm:vllm/v1/spec_decode/ngram_proposer.py|ngram_proposer.py}}{{s:vllm-project/vllm:vllm/v1/sample/rejection_sampler.py|rejection_sampler.py}}{{s:sgl-project/sglang:python/sglang/srt/speculative/eagle_worker_v2.py|SGLang eagle_worker_v2.py}}{{r:SafeAILab/EAGLE|EAGLE 官方}}{{r:FasterDecoding/Medusa|Medusa}}</div>
+      <p><b>解决 P6。</b>decode 小批时 GPU 算力大量闲置，验证 k 个 token 的成本和生成 1 个几乎一样（都是读一遍权重）。于是：用便宜的方法先猜 k 个 token（draft），再让目标模型一次前向并行验证，接受最长的正确前缀，外加目标模型在第一个拒绝位置自己采样出的一个 token。用拒绝采样（rejection sampling）做接受判断时，输出分布与目标模型<b>完全一致</b>（Leviathan et al. 2022；Chen et al. 2023）。</p>
+      <figure class="figure" id="fig-spec"><div class="fig-body"></div>
+        <figcaption><b>一次投机步。</b>draft 提议 4 个 token，目标模型一次前向验证；前 3 个被接受，第 4 个被拒绝，目标模型在该位置重新采样，共前进 4 个 token，只花了 1 次目标前向（外加 draft 开销）。</figcaption>
+      </figure>
+      <script>
+      flow("fig-spec", { w: 940, h: 210, label: "投机解码流程", nodes: [
+        { id: "ctx", x: 90, y: 60, t: "上下文", s: "… the cat", w: 130 },
+        { id: "dr", x: 290, y: 60, t: "Draft", s: "小模型 / EAGLE 头\nn-gram / MTP", k: "vio", w: 160 },
+        { id: "prop", x: 510, y: 60, t: "提议 k=4", s: "sat · on · the · mat", k: "vio", w: 170 },
+        { id: "tg", x: 760, y: 60, t: "目标模型", s: "一次前向验证 k+1 个位置", k: "acc", w: 200 },
+        { id: "acc", x: 620, y: 165, t: "接受 sat on the ✓  拒绝 mat ✗ → 采样 rug", k: "pass", w: 340 }
+      ], edges: [
+        { f: "ctx", t: "dr", k: "vio" }, { f: "dr", t: "prop", k: "vio" }, { f: "prop", t: "tg", k: "acc" }, { f: "tg", t: "acc", k: "pass", fs: "b", ts: "r" },
+        { f: "acc", t: "ctx", k: "pass", fs: "l", ts: "b", st: true, a: true, l: "+4 tokens，进入下一步" }
+      ]});
+      </script>
+      <div class="formula">每次验证期望前进的 token 数 = (1 − α^(k+1)) / (1 − α)        <span style="color:var(--muted)"># α = 每个 draft token 的接受率，k = draft 长度</span>
+例：α = 0.8, k = 4 → (1 − 0.8⁵)/0.2 ≈ 3.36 个 token / 次目标前向
+实际加速 = 期望 token 数 ÷ (1 + draft 开销占比 + 验证比单 token 多出的开销)</div>
+      <div class="table-box"><table>
+        <thead><tr><th>方法</th><th>draft 从哪来</th><th>特点</th></tr></thead>
+        <tbody>
+          <tr><td class="k">独立 draft 模型</td><td>同 tokenizer 的小模型（如 1B 给 70B 打草稿）</td><td>通用；但要额外显存和调度，小模型与大模型分布差距决定 α</td></tr>
+          <tr><td class="k">n-gram / prompt lookup</td><td>从 prompt 或已生成文本里找匹配的后续</td><td>零训练、零显存；代码编辑、RAG、改写等“输出大量复制输入”的场景很有效</td></tr>
+          <tr><td class="k">Medusa</td><td>在目标模型最后一层上加多个预测头，各预测 +1、+2… 位置</td><td>需要训练头；树状候选 + tree attention 验证</td></tr>
+          <tr><td class="k">EAGLE / EAGLE-2 / EAGLE-3</td><td>轻量的自回归头，输入目标模型的隐藏特征（EAGLE-3 融合多层特征）</td><td>接受率高，SGLang / vLLM 主力方案；EAGLE-2 动态草稿树</td></tr>
+          <tr><td class="k">MTP（Multi-Token Prediction）</td><td>模型训练时自带的多 token 预测模块（DeepSeek-V3、部分 Qwen / GLM / MiMo 模型）</td><td>无需另训 draft；DeepSeek-V3 报告第 2 个 token 接受率约 85–90%</td></tr>
+          <tr><td class="k">Lookahead / Jacobi</td><td>目标模型自己并行迭代猜测</td><td>无 draft，但收益通常较小</td></tr>
+        </tbody>
+      </table></div>
+      <div class="callout warn"><b class="h">什么时候投机解码反而变慢</b>
+        <p>大批量时 GPU 已接近 compute-bound，多验证的 k 个 token 不再“免费”，被拒绝的 token 是纯浪费。高温采样、开放式创作时 α 低。因此生产系统常按负载动态调 k 或关闭投机；面试时要能说出“投机解码用算力换延迟，适合低并发、延迟敏感的场景”。</p>
+      </div>

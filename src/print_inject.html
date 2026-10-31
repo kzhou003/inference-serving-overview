@@ -1,0 +1,60 @@
+<style>
+@page { size: A4; margin: 13mm 12mm 14mm; }
+@media print {
+  .chapter-map { margin: 0 0 16px; border: 1px solid var(--coast); border-radius: 10px; overflow: hidden; background: var(--sea); break-inside: avoid; }
+  .chapter-map svg { display: block; width: 100%; height: auto; }
+  .chapter-map figcaption { font-family: var(--font-map); font-size: 12px; color: var(--map-ink); background: var(--land); border-top: 1px solid var(--coast); padding: 5px 12px; display: flex; justify-content: space-between; }
+  .chapter-map .place.here .mk-ring { opacity: 1 !important; animation: none !important; stroke-width: 3; transform: scale(1.7); transform-box: fill-box; transform-origin: center; }
+  .map-fig { break-inside: avoid; }
+  .map-intro .lede { font-size: 12.5px; }
+  main.chapter-pane > section { padding-top: 0 !important; }
+  main.chapter-pane > section > h2 { margin-top: 4px; }
+}
+</style>
+<script>
+/* Print build: open every Q&A and give each chapter a DDIA-style opening map — a crop of the atlas centred on the chapter's place. */
+(function () {
+  document.querySelectorAll("details").forEach((d) => (d.open = true));
+  const atlas = document.getElementById("atlasMap");
+  const W = 1000, H = 700, VW = 560, VH = 230;
+  document.querySelectorAll("main.chapter-pane > section").forEach((sec) => {
+    const place = atlas.querySelector(`.place[data-sec="${sec.id}"]`);
+    if (!place) return;
+    const mk = place.querySelector(".mk");
+    const cx = +mk.getAttribute("cx"), cy = +mk.getAttribute("cy");
+    // centre the crop on the marker but bias toward its label, then clamp to the chart
+    const lab = place.querySelector(".pl-name");
+    const lx = lab ? +lab.getAttribute("x") : cx, ly = lab ? +lab.getAttribute("y") : cy;
+    let x = (cx + lx) / 2 - VW / 2, y = (cy + ly) / 2 - VH / 2;
+    x = Math.max(0, Math.min(W - VW, x)); y = Math.max(0, Math.min(H - VH, y));
+    const svg = atlas.cloneNode(true);
+    // the clone keeps id="atlasMap" so the #atlasMap-scoped map styles apply to it too
+    svg.setAttribute("viewBox", `${x} ${y} ${VW} ${VH}`);
+    svg.querySelectorAll(".place, .sub").forEach((p) => p.classList.remove("here"));
+    svg.querySelector(`.place[data-sec="${sec.id}"]`).classList.add("here");
+    // vignette: fade everything away from the chapter's place
+    const NS = "http://www.w3.org/2000/svg";
+    const defs = document.createElementNS(NS, "defs");
+    const gid = "vg-" + sec.id;
+    defs.innerHTML = `<radialGradient id="${gid}" gradientUnits="userSpaceOnUse" cx="${cx}" cy="${cy}" r="${VW * 0.62}">
+      <stop offset="0.35" style="stop-color:var(--sea);stop-opacity:0"/><stop offset="1" style="stop-color:var(--sea);stop-opacity:0.72"/></radialGradient>`;
+    svg.appendChild(defs);
+    const veil = document.createElementNS(NS, "rect");
+    veil.setAttribute("x", x); veil.setAttribute("y", y); veil.setAttribute("width", VW); veil.setAttribute("height", VH);
+    veil.setAttribute("fill", `url(#${gid})`); veil.setAttribute("pointer-events", "none");
+    // keep the chapter's own marker and label above the veil
+    const here = svg.querySelector(`.place[data-sec="${sec.id}"]`);
+    svg.insertBefore(veil, here.parentNode);
+    here.parentNode.appendChild(here);
+    svg.appendChild(here.parentNode);
+    const fig = document.createElement("figure");
+    fig.className = "chapter-map";
+    fig.appendChild(svg);
+    const cap = document.createElement("figcaption");
+    const name = lab ? lab.textContent : "", sub = place.querySelector(".pl-sub");
+    cap.innerHTML = `<span>第 ${place.querySelector(".mk-n").textContent} 章 · ${name}</span><span>${sub ? sub.textContent : ""}</span>`;
+    fig.appendChild(cap);
+    sec.insertBefore(fig, sec.firstChild);
+  });
+})();
+</script>

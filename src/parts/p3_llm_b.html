@@ -1,0 +1,159 @@
+
+      <h3 id="kernels">4.6 Kernel 与 runtime：把每一步做快</h3>
+      <p><b>解决 P8、P9。</b>批处理和调度决定“算什么”，kernel 和 runtime 决定“算得多快”。理解 kernel 最好的办法是沿着一层 decoder 的执行顺序，看每一步调用了哪个 kernel、它是 compute-bound 还是 memory-bound、和谁可以融合。</p>
+      <figure class="figure" id="fig-kmap"><div class="fig-body"></div>
+        <figcaption><b>一层 decoder（MoE 模型）在 decode 时的 kernel 序列。</b>蓝色是 GEMM 类（Tensor Core），绿色是 attention，紫色是通信，橙色是可以被融合掉的小 kernel。实线框内的一串小 kernel 在优化后通常融合为 1–2 个 launch；整层再被 CUDA graph 录制成一次提交。</figcaption>
+      </figure>
+      <script>
+      flow("fig-kmap", { w: 1000, h: 330, label: "decoder 层的 kernel 序列", nodes: [
+        { id: "n1", x: 80, y: 70, t: "Add + RMSNorm", s: "融合残差 · 量化输出", k: "warn", w: 140 },
+        { id: "qkv", x: 245, y: 70, t: "QKV GEMM", s: "FP8 / FP4 GEMM", k: "acc", w: 130 },
+        { id: "rope", x: 405, y: 70, t: "RoPE + 写 KV", s: "reshape_and_cache", k: "warn", w: 150 },
+        { id: "att", x: 580, y: 70, t: "Attention", s: "prefill: FA3/FA4\ndecode: paged / MLA", k: "pass", w: 160 },
+        { id: "o", x: 750, y: 70, t: "O-proj GEMM", k: "acc", w: 120 },
+        { id: "ar", x: 900, y: 70, t: "All-reduce", s: "custom AR / NVLS\n+ 融合 RMSNorm", k: "vio", w: 150 },
+        { id: "gate", x: 900, y: 205, t: "Router / Gate", s: "top-k + softmax", k: "warn", w: 150 },
+        { id: "disp", x: 735, y: 205, t: "Dispatch", s: "DeepEP / all-to-all", k: "vio", w: 140 },
+        { id: "gg", x: 565, y: 205, t: "Grouped GEMM ×2", s: "gate_up · down\nSwiGLU 融合", k: "acc", w: 160 },
+        { id: "comb", x: 395, y: 205, t: "Combine", s: "all-to-all + 加权", k: "vio", w: 140 },
+        { id: "next", x: 230, y: 205, t: "下一层 …", s: "× n_layers", w: 120 },
+        { id: "lm", x: 230, y: 290, t: "LM head GEMM", s: "vocab 15 万+", k: "acc", w: 150 },
+        { id: "smp", x: 420, y: 290, t: "Sampling", s: "top-k/p 无排序拒绝采样\n+ grammar bitmask", k: "warn", w: 200 }
+      ], edges: [
+        { f: "n1", t: "qkv", k: "acc" }, { f: "qkv", t: "rope", k: "acc" }, { f: "rope", t: "att", k: "pass" }, { f: "att", t: "o", k: "acc" }, { f: "o", t: "ar", k: "vio" },
+        { f: "ar", t: "gate", k: "warn" }, { f: "gate", t: "disp", k: "vio" }, { f: "disp", t: "gg", k: "acc" }, { f: "gg", t: "comb", k: "vio" }, { f: "comb", t: "next" },
+        { f: "next", t: "lm", k: "acc", d: true, l: "最后一层后" }, { f: "lm", t: "smp", k: "warn" }
+      ], groups: [{ x: 6, y: 22, w: 988, h: 100, t: "attention 子层" }, { x: 155, y: 158, w: 839, h: 96, t: "MoE 子层" }]});
+      </script>
+
+      <h4>按类别看 kernel：要解决什么、代表实现、源码</h4>
+      <div class="table-box"><table>
+        <thead><tr><th>类别</th><th>核心难点</th><th>代表实现与要点</th><th>源码入口</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Prefill attention</td><td>O(N²) 计算，不能物化 N×N 分数矩阵</td><td>FlashAttention：分块 + online softmax，Q 块常驻 SRAM，循环读 K/V 块。FA2 改并行划分（按序列分块到 thread block）；FA3（Hopper）用 TMA 异步搬运 + WGMMA + warp specialization（生产者 warp 搬数据、消费者 warp 算）+ ping-pong 调度隐藏 softmax；FA4（Blackwell）用 CuTe DSL 编写，利用 tcgen05 / TMEM</td><td><div class="srcs">{{s:Dao-AILab/flash-attention:csrc/flash_attn/src/flash_fwd_kernel.h|FA2 kernel}}{{s:Dao-AILab/flash-attention:hopper|FA3 hopper/}}{{s:Dao-AILab/flash-attention:flash_attn/cute|FA4 cute/}}</div></td></tr>
+          <tr><td class="k">Decode / paged attention</td><td>每个请求只 1 个 query，KV 散落在分页 block 里；批小时 SM 吃不满</td><td>按 block table 间接读 KV；split-KV（Flash-Decoding）沿序列切分再归约；FlashInfer 用统一的 block-sparse 格式 + 运行时 <i>plan</i> 做负载均衡；cascade attention 让共享前缀只读一次；TRT-LLM 的 XQA 针对 GQA 把同组 query head 合并成一个 tile</td><td><div class="srcs">{{s:flashinfer-ai/flashinfer:include/flashinfer/attention/decode.cuh|decode.cuh}}{{s:flashinfer-ai/flashinfer:include/flashinfer/attention/prefill.cuh|prefill.cuh}}{{s:flashinfer-ai/flashinfer:include/flashinfer/attention/scheduler.cuh|scheduler.cuh}}{{s:flashinfer-ai/flashinfer:include/flashinfer/attention/cascade.cuh|cascade.cuh}}{{s:flashinfer-ai/flashinfer:include/flashinfer/page.cuh|page.cuh}}{{s:NVIDIA/TensorRT-LLM:cpp/kernels/xqa|TRT-LLM XQA}}</div></td></tr>
+          <tr><td class="k">MLA attention</td><td>latent 维度 512 + RoPE 64，decode 时要“吸收”上投影</td><td>FlashMLA（Hopper / Blackwell，含稀疏版本供 DSA 使用）；FlashInfer MLA；推理时把 W_UK 吸收进 Q、W_UV 吸收进 O，attention 直接在 latent 上算（MQA 形式）</td><td><div class="srcs">{{s:deepseek-ai/FlashMLA:flash_mla/flash_mla_interface.py|FlashMLA 接口}}{{s:deepseek-ai/FlashMLA:csrc|FlashMLA csrc}}{{s:vllm-project/vllm:vllm/v1/attention/backends/mla|vLLM MLA backends}}</div></td></tr>
+          <tr><td class="k">线性注意力 / SSM</td><td>状态递推是串行的，要变成可并行的 chunk 形式</td><td>chunkwise 并行：块内用矩阵乘，块间传递状态；Mamba 的 selective scan、causal-conv1d；flash-linear-attention（fla）收录 GLA、DeltaNet、Gated DeltaNet 等 Triton kernel</td><td><div class="srcs">{{s:fla-org/flash-linear-attention:fla/ops|fla/ops}}{{s:state-spaces/mamba:csrc/selective_scan|mamba selective_scan}}{{s:vllm-project/vllm:vllm/model_executor/layers/mamba|vLLM mamba/GDN 层}}</div></td></tr>
+          <tr><td class="k">Dense GEMM</td><td>decode 时 M（token 数）很小，是“瘦”矩阵；量化后要带 scale</td><td>cuBLAS / cuBLASLt；CUTLASS 模板（tile 形状、stage 数、epilogue 融合）；DeepGEMM：FP8 细粒度（1×128 / 128×128）scale，JIT 编译，代码量很小适合精读；split-K / stream-K 解决 M 小时 tile 数不够的问题</td><td><div class="srcs">{{s:NVIDIA/cutlass:examples/cute/tutorial|CuTe 教程}}{{s:deepseek-ai/DeepGEMM:deep_gemm/include/deep_gemm/impls|DeepGEMM impls}}{{r:NVIDIA/cutlass|CUTLASS}}</div></td></tr>
+          <tr><td class="k">混合精度 GEMM</td><td>INT4 / FP4 权重 × BF16 激活，反量化不能拖慢</td><td>Marlin：权重预重排，反量化与 Tensor Core 计算流水重叠，batch 16–32 内接近 4× 理论加速；Machete（Hopper 版）；MoE 版 Marlin</td><td><div class="srcs">{{r:IST-DASLab/marlin|Marlin}}{{s:vllm-project/vllm:csrc/moe/marlin_moe_wna16|vLLM MoE Marlin}}</div></td></tr>
+          <tr><td class="k">MoE GEMM</td><td>每个专家的 token 数不同且很少，形状随路由变化</td><td>按专家排序 token（align / permute）后做 grouped GEMM；Triton fused_moe（vLLM / SGLang 的通用路径）；DeepGEMM 的 contiguous（prefill）与 masked（decode，形状固定便于 CUDA graph）布局；CUTLASS grouped GEMM；FlashInfer / TRT-LLM 的 fused MoE</td><td><div class="srcs">{{s:vllm-project/vllm:vllm/model_executor/layers/fused_moe/fused_moe.py|vLLM fused_moe.py}}{{s:vllm-project/vllm:vllm/model_executor/layers/fused_moe/modular_kernel.py|modular_kernel.py}}{{s:flashinfer-ai/flashinfer:csrc/fused_moe|FlashInfer fused_moe}}</div></td></tr>
+          <tr><td class="k">通信</td><td>TP all-reduce 每层两次、EP all-to-all 延迟敏感</td><td>NCCL；小消息用自定义 one-shot / two-shot all-reduce（直接读写对端显存，IPC handle）；NVLink SHARP（NVLS）多播；DeepEP（normal + low-latency，NVSHMEM / IBGDA）、pplx-kernels；MSCCL++</td><td><div class="srcs">{{s:vllm-project/vllm:csrc/custom_all_reduce.cuh|vLLM custom AR}}{{s:sgl-project/sglang:python/sglang/kernels/aot/csrc/allreduce|SGLang allreduce}}{{s:deepseek-ai/DeepEP:csrc/kernels|DeepEP kernels}}{{r:perplexityai/pplx-kernels|pplx-kernels}}{{s:NVIDIA/nccl:src/device|NCCL device}}{{r:microsoft/mscclpp|MSCCL++}}</div></td></tr>
+          <tr><td class="k">小算子与融合</td><td>memory-bound，launch 多</td><td>RMSNorm + 残差、SiLU×Mul、RoPE、per-token FP8 量化、KV 写入（reshape_and_cache）；融合进 GEMM 的 prologue / epilogue 或彼此融合</td><td><div class="srcs">{{s:vllm-project/vllm:csrc/layernorm_kernels.cu|layernorm}}{{s:vllm-project/vllm:csrc/activation_kernels.cu|activation}}{{s:vllm-project/vllm:csrc/pos_encoding_kernels.cu|RoPE}}{{s:vllm-project/vllm:csrc/cache_kernels.cu|cache_kernels}}</div></td></tr>
+          <tr><td class="k">采样</td><td>15 万词表上做 top-k / top-p，排序很贵</td><td>FlashInfer 的无排序拒绝采样（反复抽样 + 阈值，期望几轮收敛）；Triton top-k/top-p；结构化输出的 bitmask 在采样前按位应用</td><td><div class="srcs">{{s:flashinfer-ai/flashinfer:include/flashinfer/sampling.cuh|sampling.cuh}}{{s:vllm-project/vllm:vllm/v1/sample/ops/topk_topp_sampler.py|vLLM topk_topp}}{{s:vllm-project/vllm:vllm/v1/sample/sampler.py|vLLM sampler}}</div></td></tr>
+          <tr><td class="k">Runtime：图与编译</td><td>每步几百个 launch，CPU 赶不上 GPU</td><td>CUDA graph 按批大小预捕获；vLLM V1 piecewise graph（attention 在图外）+ FULL graph 模式；torch.compile 自定义 pass（量化融合、AR 融合）；SGLang 分 prefill / decode 两类 graph runner</td><td><div class="srcs">{{s:vllm-project/vllm:vllm/v1/cudagraph_dispatcher.py|cudagraph_dispatcher}}{{s:vllm-project/vllm:vllm/compilation/backends.py|compilation/backends}}{{s:sgl-project/sglang:python/sglang/srt/model_executor/runner/decode_cuda_graph_runner.py|SGLang decode graph}}</div></td></tr>
+          <tr><td class="k">确定性 kernel</td><td>归约顺序随批大小变化 → 结果随批变化</td><td>batch-invariant 的 matmul / RMSNorm / attention：固定 split 策略，不随批大小切换 kernel 配置</td><td><div class="srcs">{{s:vllm-project/vllm:vllm/model_executor/determinism/batch_invariant.py|vLLM batch_invariant}}{{s:sgl-project/sglang:python/sglang/srt/batch_invariant_ops|SGLang batch_invariant_ops}}</div></td></tr>
+          <tr><td class="k">Megakernel</td><td>batch=1 时 kernel 边界和 launch 本身就是开销</td><td>把整层乃至整个前向编译成一个持久化 kernel，在 SM 内调度任务图（Mirage Persistent Kernel；Hazy Research 的 Llama megakernel）</td><td><div class="srcs">{{r:mirage-project/mirage|Mirage MPK}}{{s:HazyResearch/ThunderKittens:kernels|ThunderKittens kernels}}</div></td></tr>
+        </tbody>
+      </table></div>
+
+      <h4>面试常问的 kernel 概念</h4>
+      <div class="table-box"><table>
+        <thead><tr><th>概念</th><th>一句话解释</th><th>为什么推理里重要</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Tiling / 分块</td><td>把大矩阵切成能放进 shared memory / 寄存器的块，块内复用数据</td><td>决定算术强度；FlashAttention、GEMM 的核心</td></tr>
+          <tr><td class="k">Online softmax</td><td>流式维护 running max 和 running sum，分块算 softmax 而不需要整行</td><td>attention 不物化 N×N 的前提；split-KV 归约也靠它（合并 LSE）</td></tr>
+          <tr><td class="k">Warp specialization</td><td>同一 block 内不同 warp 分工（搬数据 / 计算 / 写回），用 barrier 流水</td><td>Hopper 之后高性能 kernel 的标准写法（FA3、DeepGEMM）</td></tr>
+          <tr><td class="k">TMA / WGMMA / tcgen05</td><td>Hopper 的张量内存加速器做异步块搬运，WGMMA 是 warpgroup 级 MMA；Blackwell 的 tcgen05 MMA 把累加器放到专用的 Tensor Memory（TMEM）</td><td>不同代际 kernel 无法直接复用，这就是为什么每代 GPU 都有新版 FA / GEMM</td></tr>
+          <tr><td class="k">Persistent kernel / stream-K / split-K</td><td>常驻 kernel 循环领取 tile；沿 K 维切分以增加并行度</td><td>decode 的瘦 GEMM tile 太少，不切就吃不满 SM</td></tr>
+          <tr><td class="k">Epilogue 融合</td><td>GEMM 写回前顺便做 bias、激活、量化、残差</td><td>省掉一次 HBM 往返</td></tr>
+          <tr><td class="k">Occupancy 与寄存器压力</td><td>每个 SM 同时驻留的 warp 数受寄存器 / shared memory 限制</td><td>memory-bound kernel 需要足够多的在途访存来掩盖延迟</td></tr>
+          <tr><td class="k">PDL / CUDA graph</td><td>Programmatic Dependent Launch 让下一个 kernel 提前启动 prologue；graph 一次提交整串 kernel</td><td>decode 一步只有几毫秒，launch 间隙占比显著</td></tr>
+        </tbody>
+      </table></div>
+      <p>写 kernel 的工具链：CUDA C++ + CUTLASS / CuTe 仍是性能天花板；Triton 是最常用的 Python DSL（vLLM / SGLang 大量 MoE、attention 变体用它）；CuTe DSL（Python 版 CUTLASS，FA4 用它）、TileLang（DeepSeek 的稀疏 attention 等用它写参考实现）、ThunderKittens 让写 Hopper / Blackwell 专用 kernel 更容易。</p>
+      <div class="srcs"><span class="srcs-label">工具链源码</span>{{r:triton-lang/triton|Triton}}{{s:tile-ai/tilelang:examples|TileLang examples}}{{r:HazyResearch/ThunderKittens|ThunderKittens}}{{w:flashinfer-ai/flashinfer|FlashInfer · Code Wiki}}{{w:Dao-AILab/flash-attention|FlashAttention · Code Wiki}}{{w:deepseek-ai/DeepGEMM|DeepGEMM · Code Wiki}}</div>
+
+      <h3 id="quant">4.7 量化：少读字节、多放 KV</h3>
+      <div class="srcs"><span class="srcs-label">源码</span>{{s:vllm-project/vllm:vllm/model_executor/layers/quantization/fp8.py|vLLM fp8.py}}{{s:vllm-project/vllm:vllm/model_executor/layers/quantization|quantization/ 各方法}}{{r:vllm-project/llm-compressor|llm-compressor}}{{r:IST-DASLab/marlin|Marlin}}</div>
+      <p><b>解决 P3、P6、P7。</b>decode 是 memory-bound，权重字节数减半，单步时间就接近减半；同时省下的显存给 KV，批更大。prefill 是 compute-bound，只有激活也量化（W8A8、FP8、FP4）且用对应的 Tensor Core 指令时才加速。</p>
+      <div class="table-box"><table>
+        <thead><tr><th>方案</th><th>量化对象</th><th>收益</th><th>代表方法 / 硬件</th><th>注意</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Weight-only INT4 / INT8</td><td>只量化权重，计算时反量化</td><td>decode 加速明显、显存省 2–4×</td><td>GPTQ（二阶误差补偿）、AWQ（按激活幅度保护重要通道）；Marlin kernel</td><td>大批 / prefill 收益小，反量化有开销</td></tr>
+          <tr><td class="k">W8A8 INT8</td><td>权重 + 激活</td><td>prefill 也加速</td><td>SmoothQuant（把激活离群值“平移”到权重）</td><td>激活离群值是难点</td></tr>
+          <tr><td class="k">FP8（E4M3）</td><td>权重 + 激活，per-tensor / per-channel / 分块 scale</td><td>近乎无损，算力 2×</td><td>Hopper 起原生；DeepSeek-V3 用 128×128 分块 scale</td><td>当前生产最常用</td></tr>
+          <tr><td class="k">FP4（NVFP4 / MXFP4）</td><td>权重（+ 激活）</td><td>再翻倍</td><td>NVFP4：16 元素一组、FP8 scale（Blackwell）；MXFP4：32 元素一组、E8M0 scale（OCP 标准，gpt-oss 原生发布）</td><td>更依赖 QAT / 好的校准</td></tr>
+          <tr><td class="k">KV cache 量化</td><td>K / V</td><td>KV 容量 2×、attention 带宽减半</td><td>FP8 KV 最常见，也有 INT4 KV</td><td>长上下文任务要专门评测</td></tr>
+        </tbody>
+      </table></div>
+      <p>工具：vLLM 的 <code>llm-compressor</code>、NVIDIA ModelOpt、Intel AutoRound、PyTorch torchao、bitsandbytes、llama.cpp 的 GGUF k-quants。面试常问“量化后怎么验证”：除了 perplexity，一定要在目标任务（数学、代码、长上下文检索）上评测，量化对推理链长的任务更敏感。</p>
+
+      <h3 id="arch">4.8 模型结构侧的优化：从源头减小 KV 与计算</h3>
+      <div class="srcs"><span class="srcs-label">源码</span>{{s:vllm-project/vllm:vllm/v1/attention/backends/mla|vLLM MLA backends}}{{s:vllm-project/vllm:vllm/model_executor/layers/mamba|vLLM mamba / GDN}}{{s:vllm-project/vllm:vllm/v1/core/single_type_kv_cache_manager.py|按层类型的 KV 管理}}{{r:fla-org/flash-linear-attention|flash-linear-attention}}{{r:deepseek-ai/FlashMLA|FlashMLA}}</div>
+      <p><b>解决 P3、P10。</b>很多“推理优化”其实发生在模型设计阶段，serving 系统要跟着支持。</p>
+      <div class="table-box"><table>
+        <thead><tr><th>结构</th><th>做法</th><th>KV / 计算影响</th><th>serving 要配合什么</th></tr></thead>
+        <tbody>
+          <tr><td class="k">MQA / GQA</td><td>多个 query head 共享一组 K/V head</td><td>KV 缩小 n_heads / n_kv_heads 倍（Llama-3-70B：64 / 8 = 8×）</td><td>TP 切分时 KV head 数可能小于 TP 数，需要复制 KV head</td></tr>
+          <tr><td class="k">MLA（DeepSeek-V2/V3）</td><td>把 K/V 压成低秩 latent（512 维）+ 解耦的 RoPE key</td><td>KV 比同规模 MHA 小一个数量级以上</td><td>decode 时把上投影矩阵“吸收”进 Q 和 O；专用 kernel（FlashMLA、FlashInfer MLA）；TP 不切 latent → 常用 DP attention</td></tr>
+          <tr><td class="k">滑动窗口 / 局部注意力</td><td>只看最近 W 个 token；常与全局层交错（Gemma 3 为 5:1）</td><td>局部层 KV 恒定</td><td>按层类型分开管理 KV（vLLM V1 hybrid KV allocator）</td></tr>
+          <tr><td class="k">线性注意力 / SSM 混合</td><td>Mamba、Gated DeltaNet、Lightning Attention 等与少量全注意力层混合（Jamba、Qwen3-Next、MiniMax-M1、Kimi Linear）</td><td>大部分层只存固定大小的状态</td><td>状态不能按 token 切页，前缀 cache 需要定期存状态快照</td></tr>
+          <tr><td class="k">稀疏注意力</td><td>每个 query 只取 top-k 相关 token（NSA、DeepSeek-V3.2 的 DSA）</td><td>长上下文 attention 计算接近线性</td><td>索引器 kernel + 稀疏 gather</td></tr>
+          <tr><td class="k">MoE</td><td>每个 token 只激活少数专家</td><td>计算按激活参数算，显存按总参数算</td><td>见 <a href="#moe">05</a></td></tr>
+        </tbody>
+      </table></div>
+
+      <h3 id="parallel">4.9 并行策略：模型放不下、或一张卡太慢</h3>
+      <div class="srcs"><span class="srcs-label">源码</span>{{s:vllm-project/vllm:vllm/distributed/parallel_state.py|vLLM parallel_state.py}}{{s:vllm-project/vllm:vllm/distributed/device_communicators/all2all.py|all2all.py}}{{s:sgl-project/sglang:python/sglang/srt/managers/data_parallel_controller.py|SGLang DP controller}}{{s:NVIDIA/Megatron-LM:megatron/core/tensor_parallel|Megatron tensor_parallel}}</div>
+      <p><b>解决 P7、P10。</b>推理里的并行与训练相似，但目标不同：训练追求吞吐，推理还要压单请求延迟，所以 PP 在推理中没那么受欢迎（它不降低单 token 延迟）。</p>
+      <figure class="figure" id="fig-par"><div class="fig-body"></div>
+        <figcaption><b>五种切法。</b>TP 切每层的矩阵（每层 2 次 all-reduce，必须在 NVLink 域内）；PP 切层（只在相邻 stage 间传激活，可跨机）；DP 复制整个模型；EP 把 MoE 专家分散（all-to-all）；CP/SP 沿序列维度切长 prompt（ring attention / Ulysses）。</figcaption>
+      </figure>
+      <script>
+      flow("fig-par", { w: 960, h: 290, label: "并行策略", nodes: [
+        { id: "t0", x: 122, y: 90, t: "GPU0", s: "W[:, :h/2]", k: "acc", w: 110 }, { id: "t1", x: 122, y: 190, t: "GPU1", s: "W[:, h/2:]", k: "acc", w: 110 },
+        { id: "p0", x: 300, y: 90, t: "GPU0", s: "层 1–40", k: "warn", w: 90 }, { id: "p1", x: 300, y: 190, t: "GPU1", s: "层 41–80", k: "warn", w: 90 },
+        { id: "d0", x: 430, y: 110, t: "副本 A", s: "完整模型", k: "pass", w: 90 }, { id: "d1", x: 535, y: 110, t: "副本 B", s: "完整模型", k: "pass", w: 90 },
+        { id: "e0", x: 670, y: 90, t: "GPU0", s: "专家 0–63", k: "vio", w: 96 }, { id: "e1", x: 670, y: 190, t: "GPU1", s: "专家 64–127", k: "vio", w: 96 },
+        { id: "c0", x: 825, y: 90, t: "GPU0", s: "token 0–64k", k: "teal", w: 104 }, { id: "c1", x: 825, y: 190, t: "GPU1", s: "token 64k–128k", k: "teal", w: 104 }
+      ], edges: [
+        { f: "t0", t: "t1", k: "acc", both: true, l: "all-reduce" }, { f: "p0", t: "p1", k: "warn", l: "激活" },
+        { f: "e0", t: "e1", k: "vio", both: true, l: "all-to-all" }, { f: "c0", t: "c1", k: "teal", both: true, l: "KV 环传" }
+      ], groups: [
+        { x: 15, y: 30, w: 215, h: 245, t: "TP 张量并行", k: "acc" }, { x: 245, y: 30, w: 110, h: 245, t: "PP 流水", k: "warn" },
+        { x: 370, y: 30, w: 220, h: 245, t: "DP 数据并行", k: "pass" }, { x: 605, y: 30, w: 132, h: 245, t: "EP 专家", k: "vio" }, { x: 755, y: 30, w: 140, h: 245, t: "CP 上下文", k: "teal" }
+      ], notes: [{ x: 122, y: 250, t: "每层 2 次通信", k: "acc" }, { x: 482, y: 190, t: "无通信，各自服务", k: "pass" }]});
+      </script>
+      <div class="table-box"><table>
+        <thead><tr><th>并行</th><th>通信</th><th>优点</th><th>缺点</th><th>推理中的典型用法</th></tr></thead>
+        <tbody>
+          <tr><td class="k">TP</td><td>每层 2 次 all-reduce，量 ∝ batch_tokens × hidden</td><td>降低单 token 延迟，权重和 KV 都被切分</td><td>通信频繁，跨机代价大；TP 太大时 GEMM 变瘦</td><td>机内 TP=2/4/8</td></tr>
+          <tr><td class="k">PP</td><td>相邻 stage 点对点传激活</td><td>通信少，可跨机</td><td>不降单 token 延迟；需要多个微批才能填满流水</td><td>超大模型跨机；吞吐优先</td></tr>
+          <tr><td class="k">DP</td><td>无（路由层面分流）</td><td>线性扩吞吐，最简单</td><td>每个副本都要装下整个模型</td><td>多副本 + 负载均衡；MoE 的 attention 部分做 DP</td></tr>
+          <tr><td class="k">EP</td><td>每个 MoE 层两次 all-to-all（dispatch / combine）</td><td>专家显存被分摊，每卡专家少 → 每专家批更大</td><td>负载不均、all-to-all 延迟</td><td>DeepSeek / Qwen MoE 的大规模部署</td></tr>
+          <tr><td class="k">CP / SP</td><td>ring 传 KV 或 all-to-all 换 head</td><td>超长 prompt 的 prefill 可以多卡并行</td><td>decode 收益小</td><td>百万 token 级 prefill</td></tr>
+        </tbody>
+      </table></div>
+
+      <h3 id="tenancy">4.10 结构化输出、多 LoRA、API 层功能</h3>
+      <div class="srcs"><span class="srcs-label">源码</span>{{s:mlc-ai/xgrammar:cpp|XGrammar cpp/}}{{s:vllm-project/vllm:vllm/v1/structured_output/backend_xgrammar.py|vLLM xgrammar backend}}{{s:sgl-project/sglang:python/sglang/srt/constrained/xgrammar_backend.py|SGLang xgrammar backend}}{{s:vllm-project/vllm:vllm/tool_parsers|vLLM tool_parsers/}}{{s:sgl-project/sglang:python/sglang/srt/function_call|SGLang function_call/}}{{s:vllm-project/vllm:vllm/lora/punica_wrapper|vLLM punica_wrapper}}{{s:sgl-project/sglang:python/sglang/srt/lora/lora_manager.py|SGLang lora_manager.py}}</div>
+      <p><b>解决 P11、P12。</b>这些不提升“裸性能”，但是产品必需品，而且做不好会严重拖慢吞吐。</p>
+      <ul class="facts">
+        <li><b>结构化输出（constrained decoding）。</b>把 JSON schema / 正则 / CFG 编译成自动机，每步生成一个 token mask，把非法 token 的 logit 置为 −∞。难点是 mask 计算要在 GPU 前向期间完成、不成为瓶颈。XGrammar 用下推自动机 + 预计算“与上下文无关”的 token 集合，把大部分检查挪到预处理；llguidance、Outlines 是其他实现；SGLang 早期的 compressed FSM 可以一次“跳过”确定的多个 token（jump-forward）。</li>
+        <li><b>工具调用与推理内容解析。</b>不同模型的 tool call 格式各异，服务端需要 tool-call parser 和 reasoning parser 把输出转成 OpenAI 格式的 <code>tool_calls</code> 和 <code>reasoning_content</code>。</li>
+        <li><b>Multi-LoRA。</b>一个基座 + 成百上千个 LoRA adapter 同时服务。S-LoRA 把 adapter 权重与 KV 统一分页管理并按需从 CPU 载入；Punica 的 SGMV kernel 让一个批里不同请求用不同 adapter 仍然高效。vLLM / SGLang 都支持动态加载与批内混合 adapter。</li>
+        <li><b>多租户隔离。</b>优先级、配额、按租户的公平调度、按 token 计费与限流（TPM / RPM）。</li>
+        <li><b>OpenAI 兼容 API。</b><code>/v1/chat/completions</code>、<code>/v1/completions</code>、<code>/v1/embeddings</code>、<code>/v1/audio/*</code>、Responses API；logprobs、n 采样、stop、seed 等参数都要在引擎里正确实现。</li>
+      </ul>
+
+      <h3 id="techtable">4.11 总表：技术 → 问题 → 代价</h3>
+      <div class="table-box"><table>
+        <thead><tr><th>技术</th><th>解决</th><th>核心思想</th><th>代价 / 前提</th><th>出处</th></tr></thead>
+        <tbody>
+          <tr><td class="k">Continuous batching</td><td>P2 P3</td><td>按迭代而非按请求调度</td><td>需要变长 attention kernel</td><td>Orca (OSDI ’22)</td></tr>
+          <tr><td class="k">PagedAttention</td><td>P1 P3</td><td>KV 分页 + block table</td><td>间接寻址的 kernel</td><td>vLLM (SOSP ’23)</td></tr>
+          <tr><td class="k">Prefix caching</td><td>P5</td><td>KV 跨请求复用</td><td>占用显存、需要淘汰策略</td><td>SGLang RadixAttention；vLLM APC</td></tr>
+          <tr><td class="k">KV offload / 分层</td><td>P5 P10</td><td>KV 下沉 CPU / SSD / 远端</td><td>传输带宽、一致性</td><td>Mooncake、LMCache、HiCache</td></tr>
+          <tr><td class="k">Chunked prefill</td><td>P4</td><td>prefill 切块与 decode 混批</td><td>长 prompt 的 TTFT 略增</td><td>Sarathi-Serve (OSDI ’24)</td></tr>
+          <tr><td class="k">PD 分离</td><td>P4 P13</td><td>两阶段放不同 GPU 池</td><td>KV 传输、系统复杂度</td><td>DistServe、Splitwise、Mooncake</td></tr>
+          <tr><td class="k">投机解码</td><td>P6</td><td>猜 k 个、并行验证</td><td>大批时变负收益</td><td>Leviathan ’22；Medusa；EAGLE；MTP</td></tr>
+          <tr><td class="k">FlashAttention 系列</td><td>P9 P10</td><td>IO-aware 分块</td><td>硬件专用实现</td><td>Dao et al. 2022–2025</td></tr>
+          <tr><td class="k">CUDA graph / 重叠调度</td><td>P8</td><td>消除 launch 与 CPU 空泡</td><td>静态形状、显存占用</td><td>vLLM、SGLang、TRT-LLM</td></tr>
+          <tr><td class="k">量化</td><td>P3 P6 P7</td><td>少字节</td><td>精度风险、需评测</td><td>GPTQ、AWQ、SmoothQuant、FP8/FP4</td></tr>
+          <tr><td class="k">GQA / MLA / 稀疏 / 混合</td><td>P3 P10</td><td>从结构上减 KV</td><td>需要模型训练时决定</td><td>GQA ’23、DeepSeek-V2 ’24</td></tr>
+          <tr><td class="k">TP / PP / EP / CP</td><td>P7 P10</td><td>切分模型</td><td>通信</td><td>Megatron、GShard、Ring Attention</td></tr>
+          <tr><td class="k">Multi-LoRA</td><td>P11</td><td>共享基座、批内混 adapter</td><td>adapter 管理</td><td>S-LoRA、Punica</td></tr>
+          <tr><td class="k">结构化输出</td><td>P12</td><td>grammar → token mask</td><td>mask 计算开销</td><td>XGrammar、Outlines、llguidance</td></tr>
+        </tbody>
+      </table></div>
+    </section>
