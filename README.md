@@ -4,8 +4,10 @@
 
 这是一份面向面试准备的 inference serving 系统笔记。它沿“要求 → 限制 → 问题 → 解法”展开，从 LLM serving 讲起，再扩展到 MoE、大规模集群、推理框架、后训练（RL rollout）、Omni / 语音、扩散模型、机器人、Coding Agent、AI for Science，最后是 sandbox 等相关技术、公司与开源生态、源码导读和面试速查。
 
-- **网页版**：[`index.html`](index.html)。打开后先看到全景地图，点击地点会在右侧打开对应章节；支持深浅色和手机。
-- **PDF 版**：[`inference-serving-guide.pdf`](inference-serving-guide.pdf)，75 页。包含封面、可点击的目录，每章以全景地图的局部截面开头。
+**👉 在线阅读：<https://kzhou003.github.io/inference-serving-overview/>**
+
+- **网页版**：[在线打开](https://kzhou003.github.io/inference-serving-overview/)（源文件 [`index.html`](index.html)）。打开后先看到全景地图，点击地点会在右侧打开对应章节；支持深浅色和手机。
+- **PDF 版**：[在线打开](https://kzhou003.github.io/inference-serving-overview/inference-serving-guide.pdf)（文件 [`inference-serving-guide.pdf`](inference-serving-guide.pdf)），75 页。包含封面、可点击的目录，每章以全景地图的局部截面开头。
 
 ## 内容
 
