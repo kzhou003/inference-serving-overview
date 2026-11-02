@@ -10,7 +10,7 @@
       </div>
 
       <h3>LLM 引擎</h3>
-      <div class="table-box"><table>
+      <div class="table-box" data-toc-rows><table>
         <thead><tr><th>主题</th><th>精读顺序</th><th>读的时候回答</th></tr></thead>
         <tbody>
           <tr><td class="k">vLLM 请求主路径</td><td><div class="srcs">{{s:vllm-project/vllm:vllm/entrypoints/openai/api_server.py|api_server.py}}{{s:vllm-project/vllm:vllm/v1/engine/async_llm.py|async_llm.py}}{{s:vllm-project/vllm:vllm/v1/engine/core.py|engine/core.py}}{{s:vllm-project/vllm:vllm/v1/worker/gpu_model_runner.py|gpu_model_runner.py}}{{w:vllm-project/vllm|Code Wiki}}</div></td><td>前端进程和 EngineCore 之间传的是什么？EngineCore 的忙循环里一步做了哪几件事？输出怎么流回 HTTP？</td></tr>
@@ -24,7 +24,7 @@
       </table></div>
 
       <h3>特性专题</h3>
-      <div class="table-box"><table>
+      <div class="table-box" data-toc-rows><table>
         <thead><tr><th>主题</th><th>读什么</th><th>读的时候回答</th></tr></thead>
         <tbody>
           <tr><td class="k">PD 分离</td><td><div class="srcs">{{s:vllm-project/vllm:vllm/distributed/kv_transfer/kv_connector/v1/base.py|KVConnector 接口}}{{s:vllm-project/vllm:vllm/distributed/kv_transfer/kv_connector/v1/nixl|NixlConnector}}{{s:sgl-project/sglang:python/sglang/srt/disaggregation/prefill.py|SGLang prefill.py}}{{s:sgl-project/sglang:python/sglang/srt/disaggregation/decode.py|decode.py}}{{s:ai-dynamo/nixl:src/api|NIXL API}}</div></td><td>connector 的 scheduler 侧和 worker 侧各负责什么？KV 是逐层还是整体传？decode 端如何预留空间并得知传输完成？</td></tr>
